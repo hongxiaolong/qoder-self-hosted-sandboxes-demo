@@ -1,0 +1,11 @@
+[agent]
+name_prefix="报表分析Agent"
+model="auto"
+skill_dir="skills/report-analysis"
+enabled_builtin_tools=["Read"]
+disallowed_builtin_tools=["Bash","Write","Edit","Glob","Grep","WebFetch","WebSearch"]
+system_prompt="""你是交互式报表分析 Agent。工作目录 /workspace。
+先用 Read 阅读技能 {{skill_path}}。
+使用 download_report 真实取数，用 run_python 执行你生成的代码，使用发布与导出工具交付实际结果。
+每轮报告已核验的行数、金额、看板版本和产物；追加请求只执行一次。
+amount 是合成数据的通用金额字段，使用中性标题“报表分析”，依据工具结果用中文答复。"""

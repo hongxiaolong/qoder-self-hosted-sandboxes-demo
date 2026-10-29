@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Qoder 与阿里云 Agent Sandbox 极速版的报表分析演示">
+  <title>Qoder × Agent Sandbox 极速版</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <link rel="stylesheet" href="/assets/activity.css">
+  <link rel="icon" href="/assets/qoder.svg" type="image/svg+xml">
+  <script src="/assets/portal.js" defer></script>
+  <script src="/assets/activity.js" defer></script>
+</head>
+<body class="portal-page" data-active-panel="analysis">
+  <a class="skip-link" href="#workspace">跳到执行画面</a>
+  <header class="app-header">
+    <div class="product">
+      <!-- Official Qoder icon, unmodified: https://qoder.com/favIcon.svg -->
+      <img class="qoder-logo" src="/assets/qoder.svg" width="40" height="40" alt="Qoder 官方标识">
+      <div><div class="product-name"><strong class="qoder-wordmark">Qoder</strong><span class="product-cross">×</span><span>Agent Sandbox</span><span class="edition">极速版</span></div><div class="product-subtitle">交互式报表分析 Agent · Live demo</div></div>
+    </div>
+    <nav class="header-actions" aria-label="演示操作">
+      <a class="button button-ghost" href="/source" target="_blank" rel="noopener">查看数据源 <span aria-hidden="true">↗</span></a>
+      <a class="button button-primary" id="session" target="_blank" rel="noopener noreferrer" aria-disabled="true" tabindex="-1" title="正在检查本次 Qoder 会话">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M9.5 2.5h4v4m-.5-3.5-6 6M7 3H3.5a1 1 0 0 0-1 1v8a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V9"/></svg>
+        <span id="session-label">检查会话中</span>
+      </a>
+    </nav>
+  </header>
+  <section class="runtime-strip" aria-label="运行状态">
+    <div class="runtime-status"><span class="status-dot is-loading" id="runtime-dot" aria-hidden="true"></span><strong id="runtime-label">正在连接执行环境</strong><span class="runtime-message" id="runtime-message" role="status">核对本次 Session 与 Sandbox</span></div>
+    <div class="runtime-meta"><span id="expiry"></span><span class="mono" id="run-id"></span><button class="icon-button" id="refresh-status" type="button" title="重新检查连接" aria-label="重新检查连接"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 6a5.2 5.2 0 1 0 0 4M13 2.5V6H9.5"/></svg></button></div>
+  </section>
+  <section class="workflow" aria-label="三轮演示任务">
+    <div class="workflow-intro"><span class="eyebrow">REPORT ANALYST</span><h1 class="workspace-title">报表分析工作台</h1><p>浏览器采集，代码计算，连续追问。</p></div>
+    <div class="workflow-main">
+    <div class="workflow-steps">
+      <button class="workflow-step" data-phase="collect" type="button" disabled>
+        <span class="step-index">1</span><span class="step-copy"><strong>下载并分析</strong><small>浏览器采集 · Python 计算</small></span><span class="step-state">待开始</span><svg class="copy-icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="7" height="8" rx="1.5"/><path d="M10.5 5.5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h2.5"/></svg>
+      </button>
+      <button class="workflow-step" data-phase="revise" type="button" disabled>
+        <span class="step-index">2</span><span class="step-copy"><strong>连续追问</strong><small>复用文件 · 更新统计</small></span><span class="step-state">待开始</span><svg class="copy-icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="7" height="8" rx="1.5"/><path d="M10.5 5.5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h2.5"/></svg>
+      </button>
+      <button class="workflow-step" data-phase="append" type="button" disabled>
+        <span class="step-index">3</span><span class="step-copy"><strong>现场追加</strong><small>增加记录 · 重新交付</small></span><span class="step-state">待开始</span><svg class="copy-icon" viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="7" height="8" rx="1.5"/><path d="M10.5 5.5V3a1 1 0 0 0-1-1H3a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h2.5"/></svg>
+      </button>
+    </div>
+    <div class="current-task-line" aria-live="polite"><span class="current-task-label" id="current-task-label">本轮任务</span><strong id="current-task-title">正在检查执行环境</strong><span id="current-task-description">准备好后，可复制提示词并在 Qoder 会话发送。</span></div>
+    </div>
+  </section>
+  <div class="inline-alert fallback-prompt" id="copy-fallback" hidden>
+    <div class="row between"><strong>请手动复制下面的任务提示词</strong><button class="button button-small" id="close-fallback" type="button">关闭</button></div>
+    <textarea id="prompt-text" readonly aria-label="任务提示词"></textarea>
+  </div>
+  <section class="result-overview" aria-label="当前结果概况">
+    <div><span>报表记录</span><strong id="overview-rows">—</strong></div><div><span>金额合计</span><strong id="overview-amount">—</strong></div><div><span>看板</span><strong id="overview-version">待发布</strong></div><span id="overview-note">等待分析结果</span>
+  </section>
+  <nav class="workspace-tabs" role="tablist" aria-label="切换演示视图">
+    <button class="view-tab" id="browser-tab" data-panel-target="browser" type="button" role="tab" aria-controls="browser-panel" aria-selected="false" tabindex="-1"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6h12M4.5 4.2h.1M7 4.2h.1"/></svg>浏览器现场<span class="tab-activity" id="browser-activity" hidden></span></button>
+    <button class="view-tab is-active" id="analysis-tab" data-panel-target="analysis" type="button" role="tab" aria-controls="analysis-panel" aria-selected="true"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2v11h12M5 10V7M8 10V4M11 10V6"/></svg>分析结果<span class="tab-activity" id="analysis-activity" hidden></span></button>
+  </nav>
+  <main class="workspace" id="workspace">
+    <section class="pane pane-browser" id="browser-panel" aria-labelledby="browser-panel-title">
+      <div class="pane-heading"><div><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M2 6h12M4.5 4.2h.1M7 4.2h.1"/></svg></span><strong id="browser-panel-title">执行现场</strong><span class="panel-caption">Browser Sandbox</span></div><span class="badge badge-outline">真实操作与文件证据</span></div>
+      <div class="sandbox-id-row"><code id="browser-sandbox-id">等待实例 ID</code><button class="button button-small" data-copy-sandbox="browser" disabled>复制 ID</button></div>
+      <section class="execution-card" id="browser-execution" aria-label="网页采集执行过程"></section>
+      <iframe src="/browser" title="浏览器实时画面"></iframe>
+    </section>
+    <section class="pane pane-analysis" id="analysis-panel" aria-labelledby="analysis-panel-title">
+      <div class="pane-heading"><div><span class="panel-icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M2 2v11h12M5 10V7M8 10V4M11 10V6"/></svg></span><strong id="analysis-panel-title">分析结果</strong><span class="panel-caption">Python · 看板 · 文件</span></div><span class="badge badge-outline" id="mode">自定义分析模板</span></div>
+      <div class="sandbox-id-row"><code id="analysis-sandbox-id">等待实例 ID</code><button class="button button-small" data-copy-sandbox="analysis" disabled>复制 ID</button></div>
+      <section class="execution-card" id="analysis-execution" aria-label="报表分析执行过程"></section>
+      <iframe src="/dashboard" title="分析看板"></iframe>
+    </section>
+  </main>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
