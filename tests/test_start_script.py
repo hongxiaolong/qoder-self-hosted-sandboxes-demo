@@ -3,6 +3,8 @@
 
 from pathlib import Path
 import shutil
+import re
+import select
 import subprocess
 import tempfile
 import unittest
@@ -22,6 +24,34 @@ class StartScriptTests(unittest.TestCase):
             ["bash", "-n", str(self.script)], capture_output=True, text=True
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_enter_continues_template_and_runtime_stages_instead_of_exiting(self):
+        source = self.script.read_text()
+        functions = "\n".join(re.findall(r"^(?:pause|confirm|confirm_action)\(\) \{.*?^\}", source, re.M | re.S))
+        for message in ["现在准备仓库和两个 Sandbox 模板", "现在创建本轮云端运行资源", "回收这轮已有 Qoder/Sandbox 资源并重建"]:
+            with self.subTest(message=message):
+                action = next(line for line in source.splitlines() if message in line)
+                result = subprocess.run(["/bin/bash", "-uc", 'DIM= RESET= YELLOW=;\n' + functions + '\n' + action + '\nprintf "CONTINUED\\n"'], input="\n", text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("CONTINUED", result.stdout)
+                self.assertIn("Ctrl+C", result.stdout)
+
+    def test_running_wizard_uses_loaded_body_if_script_is_updated(self):
+        gate = 'printf "READY\\n"\nIFS= read -r _\n' + '# read-ahead padding\n' * 1000
+        source = self.script.read_text().replace('if [[ "$#" -gt 0 ]]; then', gate + 'if [[ "$#" -gt 0 ]]; then', 1)
+        self.script.write_text(source)
+        process = subprocess.Popen(["/bin/bash", str(self.script), "--help"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def close_process():
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+        self.addCleanup(close_process)
+        self.assertTrue(select.select([process.stdout], [], [], 5)[0], "wizard did not reach pause")
+        self.assertEqual(process.stdout.readline().strip(), "READY")
+        self.script.write_text("# updated while running\n" * 500 + source)
+        stdout, stderr = process.communicate("\n", timeout=5)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("六阶段", stdout)
 
     def test_chinese_punctuation_does_not_extend_bash_variable_name(self):
         warning = next(line for line in self.script.read_text().splitlines() if '旧运行状态：' in line)

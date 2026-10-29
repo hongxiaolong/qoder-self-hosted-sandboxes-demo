@@ -278,8 +278,9 @@ class BootstrapTests(unittest.TestCase):
         b.ui.write_toml_values(self.root / "config/registry.toml", registry)
         (self.root / "config/app.toml").write_text('[qoder]\nbase_url="https://qoder.invalid"\n')
         original = (self.root / "config/.env").read_bytes()
-        with patch("builtins.input", return_value="reuse"), patch("e2b.Sandbox.list") as listing, patch("qoder_self_hosted_sandboxes_demo.qoder.client.API.request") as qoder, patch.object(b, "Cloud", side_effect=AssertionError("must not create resources")):
+        with patch("builtins.input", return_value="reuse"), patch("e2b.Sandbox.list") as listing, patch("qoder_self_hosted_sandboxes_demo.qoder.client.API.request") as qoder, patch.object(b.ui, "template_team_check", return_value="team-old") as team_check, patch.object(b, "Cloud", side_effect=AssertionError("must not create resources")):
             b.run(self.root)
+        team_check.assert_called_once_with(self.root)
         listing.return_value.next_items.assert_called_once()
         qoder.assert_called_once_with("GET", "/models")
         self.assertEqual((self.root / "config/.env").read_bytes(), original)

@@ -8,6 +8,10 @@
 
 set -euo pipefail
 
+# Parse the complete wizard before executing it. An update to start.sh while a
+# cloud build is running must not change Bash's subsequent file read offsets.
+run_wizard() {
+
 # ──────────────────────────────────────────────────────────────────────────
 # Wizard library: delightful, consistent UX, identical across every wizard.
 # ──────────────────────────────────────────────────────────────────────────
@@ -455,7 +459,8 @@ else
     pause "按回车重新检查，Ctrl+C 退出。"
   done
   say "先核对私有仓库和镜像拉取通路；已就绪且匹配当前代码的模板直接复用。"
-  if ! confirm_action "现在准备仓库和两个 Sandbox 模板"; then exit 0; fi
+  pause "现在准备仓库和两个 Sandbox 模板：按回车继续，Ctrl+C 退出。"
+  helper template-team-check
   helper prepare-registry
   helper docker-login
   for kind in browser analysis; do
@@ -498,13 +503,13 @@ current_status=$(helper run-status)
 case "$current_status" in
   empty|cleaned)
     say "将创建 Qoder Agent、Skill、Self-hosted Environment、Session，以及两个 Sandbox。"
-    if ! confirm_action "现在创建本轮云端运行资源"; then exit 0; fi
+    pause "现在创建本轮云端运行资源：按回车继续，Ctrl+C 退出。"
     run_cli setup
     ;;
   ready) say "✓ 当前 Session、双 Sandbox 和 Worker 可用，继续本轮，不重复创建。" ;;
   partial|expired)
     warn "检测到 $current_status 运行，需回收已有记录后重新创建。"
-    if ! confirm_action "回收这轮已有 Qoder/Sandbox 资源并重建"; then exit 0; fi
+    pause "回收这轮已有 Qoder/Sandbox 资源并重建：按回车继续，Ctrl+C 退出。"
     run_cli cleanup
     run_cli setup
     ;;
@@ -574,7 +579,7 @@ for phase in collect revise append; do
         say "在本次 Qoder 会话发送上方青色消息；也可用前端对应轮次按钮复制。若已发送，不要重发。"
         pause "确认只发送一条新消息后，按回车观察并验收。"
       else
-        pause "确认上方消息与预期后，按回车发送给 Qoder。"
+        pause "按回车发送对话框中的提示词给 Qoder；Ctrl+C 退出。"
       fi
       run_cli "$TASK_MODE" --phase "$phase"
       ;;
@@ -612,3 +617,7 @@ if [[ "$REUSED_PREVIEW" -eq 1 && "$CLEANED_THIS_RUN" -eq 1 ]]; then
   say "复用的预览由原终端管理；请在原终端 Ctrl+C 关闭。"
 fi
 say "向导结束。配置保存在 config/，运行与验收记录保存在 var/。"
+exit 0
+}
+
+run_wizard "$@"

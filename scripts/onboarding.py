@@ -481,6 +481,61 @@ def require_template_ready(status, kind):
     raise RuntimeError(kind + " 模板状态未知，不能确认是否需要重建：" + str(status))
 
 
+def template_team_check(root, *, announce=True):
+    """Resolve stale Team metadata only with matching AK and API Key evidence."""
+    from bootstrap import Cloud
+    from alibabacloud_sandbox20260820.client import Client
+    from alibabacloud_sandbox20260820.models import GetTemplateRequest
+    from e2b import Template
+    from e2b.template.types import BuildInfo
+    from qoder_self_hosted_sandboxes_demo.sandbox.client import opts
+
+    root = Path(root)
+    connection, credentials, registry = load_local(root)
+    teams = Cloud(credentials, registry["region"]).pages("sandbox", "ListTeams", "teams")
+    configured = registry["team_id"]
+    if any(team["teamID"] == configured for team in teams):
+        if announce:
+            print("✓ Sandbox Team 已确认，当前 AK 可访问。")
+        return configured
+
+    guidance = (
+        "配置中的 Team 不在当前 AK 可见范围，不能将模板 404 当作模板已删除。"
+        "请重新运行 ./start.sh，在第 2 阶段选择 discover，核对 AK、地域、Team 与 API Key；"
+        "已有配置和模板记录保留，不自动重建。"
+    )
+    saved = read_json(root / "var/state/templates.json", {})
+    identity, build_id = saved.get("browser_template"), saved.get("browser_build_id")
+    if not identity or not build_id:
+        raise RuntimeError(guidance)
+    client = Client(cloud_config(root, "sandbox." + registry["region"] + ".aliyuncs.com"))
+    matches = []
+    for team in teams:
+        try:
+            item = client.get_template(identity, GetTemplateRequest(team_id=team["teamID"])).body
+        except Exception as exc:
+            if not_found(exc):
+                continue
+            raise
+        if item and item.template_id == identity and item.team_id == team["teamID"]:
+            matches.append(team["teamID"])
+    if len(matches) != 1:
+        raise RuntimeError(guidance)
+    name = saved.get("browser_template_name", identity)
+    status = Template.get_build_status(
+        BuildInfo(template_id=identity, build_id=build_id, name=name, alias=name),
+        **opts(connection),
+    )
+    if status.template_id != identity or status.build_id != build_id or status.status != "ready":
+        raise RuntimeError("当前 API Key 尚不能确认同一 Browser 模板已就绪；" + guidance)
+    if load_local(root)[2] != registry or read_json(root / "var/state/templates.json", {}) != saved:
+        raise RuntimeError("核对期间本地配置或模板记录已改变，停止修改 Team，请重跑。")
+    write_toml_values(root / "config/registry.toml", {"team_id": matches[0]})
+    if announce:
+        print("✓ 已按现有 Browser 模板校正过期 Team 配置；保留原 Key 和模板，不重复创建。")
+    return matches[0]
+
+
 def refresh_analysis_metadata(root, identity, image):
     path = Path(root) / "var/state/templates.json"
     metadata = read_json(path, {})
@@ -542,6 +597,7 @@ def template_check(root, kind):
     identity = saved.get(kind + "_template")
     if not identity:
         raise NotReusable(kind + " 模板尚未创建")
+    template_team_check(root, announce=False)
     connection, cloud, registry = load_local(root)
     validate_config(connection, cloud, registry)
     profile = tomllib.loads((root / "config/templates.toml").read_text())[kind]
@@ -793,7 +849,7 @@ def display_events(root):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="start.sh 的配置与恢复支撑工具")
     commands = parser.add_subparsers(dest="action", required=True)
-    for name in ["configure", "bootstrap", "check-config", "prepare-registry", "run-status", "preview-status", "show-links", "summary", "finish-summary", "docker-login", "display-events"]:
+    for name in ["configure", "bootstrap", "check-config", "template-team-check", "prepare-registry", "run-status", "preview-status", "show-links", "summary", "finish-summary", "docker-login", "display-events"]:
         commands.add_parser(name)
     for name, choices in [("template-check", ["browser", "analysis"]), ("template-summary", ["browser", "analysis"]), ("phase-state", PHASES), ("round-intro", PHASES)]:
         command = commands.add_parser(name)

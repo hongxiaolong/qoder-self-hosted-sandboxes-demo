@@ -588,10 +588,11 @@ def reuse_existing_configuration(root):
     from e2b import Sandbox
     from qoder_self_hosted_sandboxes_demo.qoder.client import API
     import tomllib
+    ui.template_team_check(root)
     app = tomllib.loads((Path(root) / "config/app.toml").read_text())
     API(app["qoder"]["base_url"], connection["QODER_ACCESS_TOKEN"]).request("GET", "/models")
     Sandbox.list(limit=1, api_key=connection["E2B_API_KEY"], api_url=connection["E2B_API_URL"], domain=connection["E2B_DOMAIN"], request_timeout=15).next_items()
-    print("✓ Qoder 和原 Sandbox Key 可访问；沿用客户确认的 Team 配置，后续模板与实例调用继续验证归属。")
+    print("✓ Qoder 和原 Sandbox Key 可访问，Team 已核对；继续复用已有资源。")
     return True
 
 

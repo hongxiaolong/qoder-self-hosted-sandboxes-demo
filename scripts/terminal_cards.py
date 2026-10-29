@@ -7,14 +7,11 @@ import unicodedata
 
 ROUNDS = {
     "collect": ("1 / 3 · 首次分析", 100, 45392.18,
-                "网页采集：筛选、翻页、下载 CSV → 报表分析：运行 Python、生成看板和文件。",
-                "100 条数据 · 合计 45,392.18；浏览器与分析沙箱的文件一致。"),
+                "网页采集：筛选、翻页、下载 CSV → 报表分析：运行 Python、生成看板和文件。"),
     "revise": ("2 / 3 · 连续追问", 65, 28508.77,
-               "Browser 不重新下载；Analysis 复用 input.csv，排除最高分类并更新结果。",
-               "65 条数据 · 合计 28,508.77；input.csv 保持不变。"),
+               "Browser 不重新下载；Analysis 复用 input.csv，排除最高分类并更新结果。"),
     "append": ("3 / 3 · 现场追加", 101, 52058.18,
-               "Analysis 恢复全部分类，追加 1 条 6,666，再运行 Python、更新所有交付文件。",
-               "101 条数据 · 合计 52,058.18；Excel 含表头 102 行，新增记录在第 102 行。"),
+               "Analysis 恢复全部分类，追加 1 条 6,666，再运行 Python、更新所有交付文件。"),
 }
 
 
@@ -31,32 +28,40 @@ class Cards:
     def line(self, text="", color=""):
         print("  " + self.ink(str(text), color), file=self.stream, flush=True)
 
-    def paragraph(self, text, color=""):
-        for original in str(text).splitlines():
+    def wrapped(self, text, width):
+        for original in str(text).splitlines() or [""]:
             line, length = "", 0
             for char in original:
                 size = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1
-                if line and length + size > self.width and char not in "，。：；！？、）》】”’":
-                    self.line(line, color)
+                if line and length + size > width:
+                    yield line, length
                     line, length = "", 0
                 line += char
                 length += size
+            yield line, length
+
+    def paragraph(self, text, color=""):
+        for line, _ in self.wrapped(text, self.width):
             self.line(line, color)
 
+    def message(self, text):
+        self.line("MESSAGE · 发给 Qoder 的提示词", "cyan")
+        self.line("╭" + "─" * (self.width - 2) + "╮", "cyan")
+        for line, width in self.wrapped(text, self.width - 4):
+            self.line("│ " + line + " " * (self.width - 4 - width) + " │", "cyan")
+        self.line("╰" + "─" * (self.width - 2) + "╯", "cyan")
+
     def intro(self, phase, message, status="new"):
-        title, _, _, action, expected = ROUNDS[phase]
+        title, _, _, action = ROUNDS[phase]
         self.line()
         self.line("━" * self.width, "dim")
         self.line(title, "bold")
         self.line()
-        self.line("SEND MESSAGE · 当前配置原文", "cyan")
-        self.paragraph(message, "cyan")
+        self.message(message)
         if status != "new":
             self.line("本轮已有执行记录；下方展示配置内容，向导不会重复发送。", "dim")
         self.line()
-        self.line("发送后预期 · 默认演示数据", "yellow")
-        self.paragraph(expected, "yellow")
-        self.line("预计动作", "bold")
+        self.line("执行动作", "bold")
         self.paragraph(action)
         self.line()
 
