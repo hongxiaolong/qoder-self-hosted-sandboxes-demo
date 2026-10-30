@@ -140,11 +140,14 @@ class Cloud:
     def pages(self, service, action, collection, **query):
         rows = []
         seen = set()
+        # VPC discovery needs a smaller page size; use it for both requests
+        # and the end-of-list check when TotalCount is omitted.
+        page_size = 50 if service == "vpc" else 100
         for page in range(1, 10001):
             if service == "sandbox":
-                result = self.sandbox(action, pageNumber=page, pageSize=100, **query)
+                result = self.sandbox(action, pageNumber=page, pageSize=page_size, **query)
             else:
-                result = self.rpc(service, action, PageNumber=page, PageSize=100, **query) if service in {"vpc", "ecs"} else self.rpc(service, action, PageNo=page, PageSize=100, **query)
+                result = self.rpc(service, action, PageNumber=page, PageSize=page_size, **query) if service in {"vpc", "ecs"} else self.rpc(service, action, PageNo=page, PageSize=page_size, **query)
             values = result
             for key in collection.split("."):
                 values = values.get(key, {})
@@ -161,7 +164,7 @@ class Cloud:
                     return rows
                 if not values:
                     raise CloudError(action + " 列表提前结束，未使用不完整列表。")
-            elif len(values) < 100:
+            elif len(values) < page_size:
                 return rows
         raise CloudError("分页超过限制，未使用不完整列表。")
 
@@ -616,7 +619,7 @@ def run(root):
     if reuse_existing_configuration(root):
         return
     connection, credentials, registry = ui.load_local(root)
-    ui.config_section("2.1 · 验证两个账号入口", "阿里云：AK/SK + region；Qoder：独立 PAT。已有值可回车保留，密钥不回显。")
+    ui.config_section("2.1 · 验证两个账号入口", "阿里云：AK/SK + region；Qoder：独立 PAT。输入内容可见，已有值可回车保留。")
     for key, label in [("ALIBABA_CLOUD_ACCESS_KEY_ID", "阿里云 AK ID"), ("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "阿里云 AK Secret")]:
         credentials[key] = ui.prompt_value(label, credentials.get(key) or os.environ.get(key), secret=True, field=key)
     key = "ALIBABA_CLOUD_SECURITY_TOKEN"
@@ -654,7 +657,7 @@ def run(root):
         print("    地域   " + region)
         print("    Team   " + team["teamID"])
         print("    仓库   " + repository)
-        print("    配置   config/（密钥隐藏，文件权限 0600）")
+        print("    配置   config/（汇总不显示密钥，文件权限 0600）")
         print("  下一步：自动登录 ACR，准备网页采集与 Python 分析两套模板。")
 
 

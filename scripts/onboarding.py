@@ -3,7 +3,6 @@
 """交互向导的配置、云端预检和恢复判断；不代替 Demo CLI 执行业务流程。"""
 
 import argparse
-import getpass
 import json
 import os
 from pathlib import Path
@@ -281,7 +280,8 @@ def prompt_value(label, current="", secret=False, optional=False, field=None):
         print("  配置地址：" + CONFIG_HELP[field]["url"])
         print("  输入 ? 查看获取方式，输入 open 打开对应页面；示例仅供参考。")
     while True:
-        value = (getpass.getpass if secret else input)(label + suffix + "：").strip()
+        # Sensitive saved defaults stay private; new local input is visible.
+        value = input(label + suffix + "：").strip()
         if field and value.casefold() in {"?", "help", "帮助"}:
             show_field_help(field)
             continue
@@ -340,7 +340,7 @@ def configure(root):
                 continue
             print("✓ 已保留现有配置；接下来验证实际连接。")
             return
-    config_section("1 / 3 · Qoder 与 Sandbox", "复制真实凭证，输入会隐藏；填写后立即保存，支持中断后继续。")
+    config_section("1 / 3 · Qoder 与 Sandbox", "复制真实凭证，输入内容可见；填写后立即保存，支持中断后继续。")
     connection["QODER_ACCESS_TOKEN"] = prompt_value("Qoder 国际站 PAT", connection.get("QODER_ACCESS_TOKEN"), secret=True, field="QODER_ACCESS_TOKEN")
     write_env_values(config / ".env", {"QODER_ACCESS_TOKEN": connection["QODER_ACCESS_TOKEN"]})
     connection["E2B_API_KEY"] = prompt_value("阿里云 Sandbox Team API Key", connection.get("E2B_API_KEY"), secret=True, field="E2B_API_KEY")

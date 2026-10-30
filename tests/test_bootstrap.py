@@ -309,6 +309,46 @@ class BootstrapTests(unittest.TestCase):
             restored.record("acr", {"InstanceId": "cri-paid"})
             self.assertTrue(restored.state["resources"]["acr"]["owned"])
 
+    def test_vpc_discovery_uses_supported_page_size_and_reads_all_pages(self):
+        received = []
+        include_total = [True]
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_POST(self):
+                action = self.headers["x-acs-action"]
+                query = parse_qs(urlsplit(self.path).query)
+                page, size = int(query["PageNumber"][0]), int(query["PageSize"][0])
+                received.append((action, page, size))
+                code = 200
+                if size > 50:
+                    code, body = 400, {"Code": "InvalidParameter", "Message": 'The specified parameter "PageSize" is not valid.'}
+                else:
+                    rows = [{"id": n} for n in range((page - 1) * size, min(page * size, 75))]
+                    outer, inner = {"DescribeVSwitches": ("VSwitches", "VSwitch"), "DescribeVpcs": ("Vpcs", "Vpc")}[action]
+                    body = {outer: {inner: rows}}
+                    if include_total[0]: body["TotalCount"] = 75
+                raw = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        from alibabacloud_tea_openapi.models import Config
+        cloud = b.Cloud({"ALIBABA_CLOUD_ACCESS_KEY_ID": "test", "ALIBABA_CLOUD_ACCESS_KEY_SECRET": "test"}, "cn-hangzhou")
+        with patch.object(cloud, "config", return_value=Config(access_key_id="test", access_key_secret="test", protocol="HTTP", endpoint=f"127.0.0.1:{server.server_port}")):
+            for total in [True, False]:
+                include_total[0] = total
+                for action, collection in [("DescribeVSwitches", "VSwitches.VSwitch"), ("DescribeVpcs", "Vpcs.Vpc")]:
+                    with self.subTest(action=action, total=total):
+                        received.clear()
+                        rows = cloud.pages("vpc", action, collection, RegionId="cn-hangzhou")
+                        self.assertEqual(rows, [{"id": n} for n in range(75)])
+                        self.assertEqual(received, [(action, 1, 50), (action, 2, 50)])
+
     def test_sdk_requests_use_actual_serialization_and_signature(self):
         received = []
         class Handler(BaseHTTPRequestHandler):
