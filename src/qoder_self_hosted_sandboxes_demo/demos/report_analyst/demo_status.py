@@ -9,6 +9,7 @@ import time
 from urllib.parse import quote
 
 from qoder_self_hosted_sandboxes_demo.qoder.client import APIError
+from .lifecycle import public_history, resource_event
 
 
 class DemoStatus:
@@ -23,6 +24,9 @@ class DemoStatus:
         self.cache_seconds = cache_seconds
         self._cached = None
         self._lock = threading.Lock()
+        self._session_record = None
+        self._resource_observations = {}
+        self._resource_attempts = {}
 
     def _session_state(self, identity):
         with self._lock:
@@ -33,6 +37,8 @@ class DemoStatus:
                 session = self.client.request("GET", "/sessions/" + quote(identity, safe=""))
                 if not isinstance(session, dict) or session.get("id") != identity:
                     raise ValueError("Unexpected session response")
+                self._session_record = {key: session.get(key) for key in
+                                        ("id", "agent", "environment_id", "created_at", "metadata")}
                 status = session.get("status")
                 if isinstance(status, dict):
                     status = status.get("type") or status.get("state")
@@ -52,6 +58,47 @@ class DemoStatus:
             self._cached = (identity, now, *result)
             return result
 
+    def _observe_resources(self, state, *, history_only=False):
+        """One successful check per bound resource; retries are bounded by cache time."""
+        events = public_history(state.get("lifecycle"))
+        with self._lock:
+            for resource, route in (("agent", "agents"), ("environment", "environments"), ("session", "sessions")):
+                identifier = state.get(resource + "_id")
+                if not identifier:
+                    continue
+                key = (state.get("run_id"), resource, identifier)
+                if key in self._resource_observations:
+                    events.extend(self._resource_observations[key])
+                    continue
+                if self.clock() - self._resource_attempts.get(key, float("-inf")) < self.cache_seconds:
+                    continue
+                self._resource_attempts[key] = self.clock()
+                try:
+                    item = (self._session_record if resource == "session" and self._session_record else
+                            self.client.request("GET", "/" + route + "/" + quote(identifier, safe="")))
+                    if not isinstance(item, dict) or item.get("id") != identifier:
+                        raise ValueError("Resource identity mismatch")
+                    session = self._session_record or {}
+                    if not history_only and resource == "agent" and (session.get("agent") or {}).get("id") != identifier:
+                        raise ValueError("Session Agent mismatch")
+                    if not history_only and resource == "environment" and session.get("environment_id") != identifier:
+                        raise ValueError("Session Environment mismatch")
+                    observed = []
+                    if (not any(e["kind"] == "resource_created" and e["resource_id"] == identifier for e in events)
+                            and item.get("created_at") and (item.get("metadata") or {}).get("demo_run") == state.get("run_id")):
+                        created = resource_event("created", resource, identifier,
+                                                 created_at=item["created_at"], clock=self.clock, source="qca_record")
+                        if created["source"] == "qca_record":
+                            observed.append(created)
+                    if not history_only:
+                        observed.append(resource_event("checked", resource, identifier, clock=self.clock, source="observation"))
+                        observed.append(resource_event("reused", resource, identifier, clock=self.clock, source="observation"))
+                    self._resource_observations[key] = observed
+                    events.extend(observed)
+                except Exception:
+                    events.append(resource_event("check_failed", resource, identifier, clock=self.clock, source="observation"))
+        return public_history(events)
+
     def snapshot(self):
         result = {
             "state": "loading", "message": "等待创建演示资源。", "session_url": None,
@@ -66,19 +113,21 @@ class DemoStatus:
         if not isinstance(state, dict):
             result.update(state="unavailable", message="本地运行记录格式不正确，请检查后重新启动预览。")
             return result
-        for key in ["run_id", "analysis_sandbox_id", "browser_sandbox_id"]:
+        for key in ["run_id", "analysis_sandbox_id", "browser_sandbox_id", "session_id", "agent_id", "agent_version", "environment_id", "skill_id", "skill_version"]:
             result[key] = state.get(key)
+        result["lifecycle"] = public_history(state.get("lifecycle"))
         for phase in ["collect", "revise", "append"]:
             phase_state = (
                 "verified" if state.get(phase + "_verified") else
                 "done" if state.get(phase + "_done") else
                 "submitted" if state.get(phase + "_message_id") else "new"
             )
-            result["phases"][phase] = {"state": phase_state, "prompt": self.scenarios.get(phase, "")}
+            result["phases"][phase] = {"state": phase_state, "prompt": self.scenarios.get(phase, ""), "message_id": state.get(phase + "_message_id")}
         if not state:
             return result
         if state.get("cleaned"):
-            result.update(state="expired", message="本次 Qoder 与 Sandbox 资源已回收，请重新运行向导。")
+            result.update(state="expired", message="本轮运行资源已回收；仍可查看已记录轨迹，重新执行请运行向导。")
+            result["lifecycle"] = self._observe_resources(state, history_only=True)
             return result
         if state.get("analysis_url") != self.analysis_url:
             result.update(state="unavailable", message="此预览对应上一轮运行，请关闭旧预览并重新启动。")
@@ -97,4 +146,5 @@ class DemoStatus:
         result["state"], result["message"] = self._session_state(session_id)
         if result["state"] == "ready":
             result["session_url"] = "https://qoder.com/cloud/sessions/" + quote(session_id, safe="")
+            result["lifecycle"] = self._observe_resources(state)
         return result

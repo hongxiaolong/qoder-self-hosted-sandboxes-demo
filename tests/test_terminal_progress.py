@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,23 @@ class TerminalProgressTests(unittest.TestCase):
         self.assertIn("\033[2K", output.getvalue())
         self.assertIn("构建项目安装包", output.getvalue())
         self.assertNotIn("%", output.getvalue())
+
+    def test_narrow_tty_updates_fit_one_line_with_chinese_and_combining_text(self):
+        for columns in (20, 40, 60):
+            with self.subTest(columns=columns), patch.object(progress.shutil, "get_terminal_size", return_value=os.terminal_size((columns, 24))):
+                output = io.StringIO()
+                code = progress.run_command(
+                    [sys.executable, "-c", "print('step',flush=True)"],
+                    self.log, label="准备并连接分析环境与浏览器 e\u0301" * 3,
+                    stream=output, tty=True, mode="operation",
+                )
+                self.assertEqual(code, 0)
+                frames = output.getvalue().split("\r\033[2K")[1:-1]
+                self.assertTrue(frames)
+                self.assertTrue(all(progress.display_width(frame) < columns for frame in frames))
+                self.assertTrue(all(frame.endswith("s") for frame in frames))
+                self.assertNotIn("\033[2J", output.getvalue())
+                self.assertNotIn("\033[3J", output.getvalue())
 
     def test_registry_password_is_not_written_to_log_or_terminal(self):
         output = io.StringIO()

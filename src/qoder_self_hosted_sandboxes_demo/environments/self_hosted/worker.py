@@ -20,7 +20,7 @@ import threading
 import time
 
 from qoder_self_hosted_sandboxes_demo.qoder.client import API, APIError
-from .tools import Tools
+from .tools import Tools, credential_values, redact_value
 
 
 class Worker:
@@ -35,6 +35,7 @@ class Worker:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.stopping = threading.Event()
+        self.private_values = (*credential_values(), getattr(api, "token", ""))
         self.work_id = None
         self.cursor = None
         self.calls = {}
@@ -44,6 +45,23 @@ class Worker:
         self.interrupted = set()
         self.lease_error = None
         self.lease_ready = threading.Event()
+        self.log_lock = threading.Lock()
+        self.message_id = None
+        self.call_messages = {}
+        self.permission_logged = set()
+        self.active_tool_id = None
+        self.bind_tools()
+
+    def bind_tools(self):
+        if hasattr(self.tools, "cancel_event"):
+            self.tools.cancel_event = self.stopping
+        if hasattr(self.tools, "observe"):
+            self.tools.observe = self.tool_stage
+
+    def tool_stage(self, stage, **values):
+        if hasattr(self.tools, "check_cancelled"):
+            self.tools.check_cancelled()
+        self.log("tool_stage", tool_use_id=self.active_tool_id, stage=stage, **values)
 
     def log(self, kind, **values):
         record = {
@@ -51,13 +69,17 @@ class Worker:
             "kind": kind,
             "worker_id": self.worker_id,
             "session_id": self.session_id,
+            "work_id": self.work_id,
+            "environment_id": self.environment_id,
+            "role": "analysis",
             **values,
         }
         # Never serialize work.secret, HTTP headers, or Worker environment.
-        line = json.dumps(record, ensure_ascii=False)
-        print(line, flush=True)
-        with (self.state_dir / "worker.jsonl").open("a") as output:
-            output.write(line + "\n")
+        line = json.dumps(redact_value(record, self.private_values), ensure_ascii=False)
+        with self.log_lock:
+            print(line, flush=True)
+            with (self.state_dir / "worker.jsonl").open("a") as output:
+                output.write(line + "\n")
 
     def work_path(self, suffix=""):
         return f"/environments/{self.environment_id}/work/{self.work_id}{suffix}"
@@ -76,21 +98,32 @@ class Worker:
                 )
                 if result.get("state") in {"stopping", "stopped"}:
                     self.stopping.set()
+                    self.log("heartbeat_stopped", work_id=self.work_id, state=result.get("state"))
                     return
                 if not result.get("lease_extended"):
                     raise RuntimeError("Work lease was not extended")
                 previous = result["last_heartbeat"]
                 self.lease_ready.set()
+                self.log("heartbeat_confirmed", work_id=self.work_id,
+                         state=result.get("state"), ttl_seconds=result.get("ttl_seconds"), last_heartbeat=previous)
             except Exception as exc:
                 self.lease_error = str(exc)
                 self.stopping.set()
+                self.log("heartbeat_failed", work_id=self.work_id)
                 return
             self.stopping.wait(10)
 
     def reconcile(self):
         for event in self.api.events(self.session_id, self.cursor):
             event_id, kind = event["id"], event["type"]
-            if kind in {"agent.tool_use", "agent.custom_tool_use"}:
+            if kind == "user.message":
+                self.message_id = event_id
+            elif kind in {"agent.tool_use", "agent.custom_tool_use"}:
+                message_id = event.get("message_id") or self.message_id
+                if event_id not in self.calls:
+                    self.log("tool_observed", tool_use_id=event_id, tool=event["name"],
+                             message_id=message_id)
+                self.call_messages[event_id] = message_id
                 self.calls[event_id] = event
             elif kind in {
                 "user.tool_result",
@@ -129,8 +162,9 @@ class Worker:
             if not allowed:
                 if permission == "deny" or self.confirmed.get(tool_id) == "deny":
                     self.answered.add(tool_id)
-                else:
+                elif tool_id not in self.permission_logged:
                     self.log("permission_wait", tool_use_id=tool_id, tool=event["name"])
+                    self.permission_logged.add(tool_id)
                 continue
             cached = self.state_dir / (
                 hashlib.sha256(tool_id.encode()).hexdigest() + ".json"
@@ -144,8 +178,13 @@ class Worker:
                     tool_use_id=tool_id,
                     tool=event["name"],
                     input=event["input"],
+                    message_id=self.call_messages.get(tool_id),
                 )
-                text, error = self.tools.execute(event["name"], event["input"])
+                self.active_tool_id = tool_id
+                try:
+                    text, error = self.tools.execute(event["name"], event["input"])
+                finally:
+                    self.active_tool_id = None
                 result = {
                     "type": "user.custom_tool_result" if custom else "user.tool_result",
                     "custom_tool_use_id" if custom else "tool_use_id": tool_id,
@@ -165,6 +204,11 @@ class Worker:
                 )
             # Retry delivery, never execution. Stable idempotency key for one tool call.
             for attempt in range(3):
+                if self.stopping.is_set() or self.lease_error:
+                    self.log("tool_cancelled", tool_use_id=tool_id, tool=event["name"],
+                             message_id=self.call_messages.get(tool_id),
+                             detail="Worker stopped; cached result was not posted")
+                    return
                 try:
                     self.api.send(self.session_id, [result], f"tool-{tool_id}")
                     break
@@ -187,6 +231,7 @@ class Worker:
             json.dumps({"worker_id": self.worker_id, "session_id": self.session_id})
         )
         self.log("worker_ready", environment_id=self.environment_id)
+        self.log("worker_polling", environment_id=self.environment_id)
         heartbeat = None
         try:
             while not self.stopping.is_set() and time.monotonic() < deadline:
@@ -197,6 +242,9 @@ class Worker:
                         query={"block_ms": 999},
                         headers={"Worker-ID": self.worker_id},
                     )
+                    self.log("work_poll", result="empty" if work is None else "returned",
+                             work_id=work.get("id") if work else None,
+                             state=work.get("state") if work else None)
                     if work is None:
                         continue
                     if work.get("data", {}).get("id") != self.session_id:
@@ -204,12 +252,13 @@ class Worker:
                             "Dedicated Environment returned another Session; not acknowledged"
                         )
                     self.work_id = work["id"]
-                    self.api.request(
+                    acknowledgment = self.api.request(
                         "POST",
                         self.work_path("/ack"),
                         headers={"Worker-ID": self.worker_id},
                     )
-                    self.log("work_claimed", work_id=self.work_id)
+                    self.log("work_ack", work_id=self.work_id, state=(acknowledgment or {}).get("state"))
+                    self.log("work_claimed", work_id=self.work_id, state=(acknowledgment or {}).get("state"))
                     heartbeat = threading.Thread(target=self.heartbeats, daemon=True)
                     heartbeat.start()
                     # Require the first successful heartbeat before executing any tools.
@@ -237,8 +286,13 @@ def main(argv=None, *, prog=None):
     args = parser.parse_args(argv)
     config = json.loads(Path(args.config).read_text())
     token = os.environ.pop("QODER_ACCESS_TOKEN")
+    client = API(config["base_url"], token)
+    if config.get("run_id"):
+        from qoder_self_hosted_sandboxes_demo.qoder.telemetry import APITraceRecorder
+        client.observer = APITraceRecorder(Path(config["state_dir"]) / "api-trace.jsonl",
+            config["run_id"], session_id=config["session_id"], secrets=(token,)).record
     worker = Worker(
-        API(config["base_url"], token),
+        client,
         config["environment_id"],
         config["session_id"],
         config["worker_id"],
@@ -250,6 +304,7 @@ def main(argv=None, *, prog=None):
 
         module, factory = config["tool_provider"].split(":", 1)
         worker.tools = getattr(importlib.import_module(module), factory)(config)
+        worker.bind_tools()
     signal.signal(signal.SIGTERM, lambda *_: worker.stopping.set())
     signal.signal(signal.SIGINT, lambda *_: worker.stopping.set())
     try:

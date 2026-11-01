@@ -74,11 +74,17 @@ def create_server(root, port=8000, host="0.0.0.0", *, execution_log="/tmp/demo-w
                     )
                 static = {
                     "/assets/style.css": ("style.css", "text/css; charset=utf-8"),
-                    "/assets/activity.css": ("activity.css", "text/css; charset=utf-8"),
                     "/assets/qoder.svg": ("qoder.svg", "image/svg+xml"),
+                    "/assets/agent-sandbox.png": ("agent-sandbox.png", "image/png"),
+                    "/assets/live.css": ("live.css", "text/css; charset=utf-8"),
                     **{ "/assets/" + name + ".js": (name + ".js", "text/javascript; charset=utf-8")
-                        for name in ["portal", "browser", "dashboard", "source", "activity"] },
+                        for name in ["browser", "dashboard", "source", "live"] },
                 }
+                if path.startswith("/assets/icons/"):
+                    name = path.removeprefix("/assets/icons/")
+                    icon = assets / "icons" / name
+                    if "/" not in name and name.endswith(".svg") and icon.is_file():
+                        return self.send(icon.read_bytes(), "image/svg+xml")
                 if path in static:
                     filename, mime = static[path]
                     return self.send(

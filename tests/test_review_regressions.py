@@ -10,24 +10,41 @@ from unittest.mock import Mock, patch
 import urllib.error
 import urllib.request
 
-from qoder_self_hosted_sandboxes_demo.demos.report_analyst import cli, session, source_proxy
+from qoder_self_hosted_sandboxes_demo.demos.report_analyst import cli, session, shared, source_proxy
 
 
 class ReviewRegressionTests(unittest.TestCase):
     def test_qoder_network_failure_does_not_skip_sandbox_cleanup(self):
-        state = {"run_id": "test", "work_id": "w", "environment_id": "e",
+        state = {"run_id": "test", "work_id": "w", "environment_id": "e", "session_id": "s",
                  "analysis_sandbox_id": "a", "browser_sandbox_id": "b"}
+        records = {
+            "/sessions/s": {"id": "s", "environment_id": "e", "metadata": {"demo_run": "test"}},
+            "/environments/e": {"id": "e", "metadata": {"demo_run": "test"}},
+            "/environments/e/work/w": {
+                "id": "w", "type": "work", "environment_id": "e", "state": "active",
+                "data": {"type": "session", "id": "s"},
+            },
+        }
         def request(method, path, body=None):
             if path.endswith("/stop"):
                 raise RuntimeError("Qoder network unavailable")
-            return {"metadata": {"demo_run": "test"}}
+            self.assertEqual(method, "GET")
+            return records[path]
         client = SimpleNamespace(request=request)
-        box = Mock()
-        with patch.object(cli, "api", return_value=client), patch.object(cli, "connect", return_value=box) as connect, patch.object(cli, "save"):
+        boxes = {}
+        for key, role in (("analysis_sandbox_id", "analysis"), ("browser_sandbox_id", "browser")):
+            box = Mock()
+            box.get_info.return_value = SimpleNamespace(metadata={"demo_run": "test", "role": role})
+            boxes[key] = box
+        with patch.object(cli, "api", return_value=client), patch.object(
+            shared, "connect", side_effect=lambda _state, _values, key: boxes[key]
+        ) as connect, patch.object(cli, "save"):
             with self.assertRaisesRegex(RuntimeError, "Qoder network unavailable"):
                 cli.cleanup({}, {}, state)
         self.assertEqual(connect.call_count, 2)
-        self.assertEqual(box.kill.call_count, 2)
+        for box in boxes.values():
+            box.get_info.assert_called_once_with()
+            box.kill.assert_called_once_with()
         self.assertTrue(state["analysis_sandbox_id_killed"])
         self.assertTrue(state["browser_sandbox_id_killed"])
         self.assertFalse(state.get("cleaned", False))

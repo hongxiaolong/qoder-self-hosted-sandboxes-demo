@@ -34,8 +34,8 @@ FC_ZONES = {
 
 def confirm(message, word="yes"):
     print("\n准备执行：" + message)
-    if input("输入 " + word + " 批准；其他输入取消：").strip() != word:
-        raise SystemExit("已取消，已完成的资源记录保留。")
+    while input("输入 " + word + " 批准；Ctrl+C 退出：").strip() != word:
+        print("尚未批准，未执行此操作。请按提示输入；Ctrl+C 可退出。")
 
 
 def choose(title, rows, label, allow_new=True):
@@ -491,17 +491,41 @@ class Bootstrap:
         from alibabacloud_sandbox20260820.client import Client
         templates = ui.read_json(self.root / "var/state/templates.json", {})
         team = self.state["resources"].get("team", {}).get("value", {})
+        history = templates.get("created_templates", [])
+        # Only explicit create receipts carry ownership. A bare configured ID
+        # must never become owned merely because it appears in templates.json.
+        known_teams = {team.get("teamID")} | {
+            record.get("value", {}).get("teamID")
+            for record in self.state.get("history", []) if record.get("kind") == "team"
+        }
+        unknown = []
+        for record in history:
+            if record.get("deleted"):
+                continue
+            tid = record.get("template_id")
+            if (not record.get("created_by_demo") or not tid
+                    or record.get("region") != self.cloud.region
+                    or not record.get("team_id") or record["team_id"] not in known_teams):
+                unknown.append(str(tid or "未记录 ID"))
+                continue
+            client = Client(self.cloud.config(f"sandbox.{self.cloud.region}.aliyuncs.com"))
+            try:
+                client.delete_template(tid, models.DeleteTemplateRequest(team_id=record["team_id"]))
+            except Exception as exc:
+                if not ui.not_found(exc):
+                    raise self.cloud.error("DeleteTemplate", exc) from None
+            record["deleted"] = True
+            for kind in ("analysis", "browser"):
+                if templates.get(kind + "_template") == tid:
+                    templates.pop(kind + "_template")
+            atomic_json(self.root / "var/state/templates.json", templates)
         for kind in ("analysis", "browser"):
             tid = templates.get(kind + "_template")
-            if tid and team:
-                client = Client(self.cloud.config(f"sandbox.{self.cloud.region}.aliyuncs.com"))
-                try:
-                    client.delete_template(tid, models.DeleteTemplateRequest(team_id=team["teamID"]))
-                except Exception as exc:
-                    if not ui.not_found(exc):
-                        raise self.cloud.error("DeleteTemplate", exc) from None
-                templates.pop(kind + "_template", None)
-                atomic_json(self.root / "var/state/templates.json", templates)
+            if tid:
+                unknown.append(str(tid))
+        if unknown:
+            raise CloudError("模板归属记录不完整，已保留：" + ", ".join(dict.fromkeys(unknown))
+                             + "；请人工核对并处理后重试卸载，尚未删除仓库、网络或 Team。")
         resources = [{"kind": k, **v} for k, v in self.state["resources"].items()] + self.state.get("history", [])
         order = ["key", "repository", "namespace", "public-endpoint", "acl", "binding", "sg", "switch", "vpc", "team"]
         for kind in order:

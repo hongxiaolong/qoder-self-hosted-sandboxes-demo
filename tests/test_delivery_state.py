@@ -69,11 +69,11 @@ class DeliveryStateTests(unittest.TestCase):
         self.assertFalse(self.dashboard()["exports_ready"])
 
     def test_frontend_scripts_have_explicit_javascript_routes(self):
-        for name in ["portal", "dashboard", "browser", "source"]:
+        for name in ["live", "dashboard", "browser", "source"]:
             with self.subTest(script=name):
                 with urllib.request.urlopen(f"http://127.0.0.1:{self.server.server_port}/assets/{name}.js") as response:
                     self.assertIn("javascript", response.headers["Content-Type"])
-                    self.assertIn(b"'use strict'", response.read())
+                    self.assertRegex(response.read(), rb"['\"]use strict['\"]")
         with urllib.request.urlopen(f"http://127.0.0.1:{self.server.server_port}/assets/qoder.svg") as response:
             self.assertEqual(response.headers["Content-Type"], "image/svg+xml")
             self.assertIn(b"<svg", response.read())

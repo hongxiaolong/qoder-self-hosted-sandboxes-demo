@@ -11,11 +11,46 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import tempfile
+import time
 
 MAX_OUTPUT = 24000
+
+
+def credential_values():
+    """Collect values for replacement without ever serializing the environment."""
+    return tuple(value for key, value in os.environ.items()
+                 if re.search(r"TOKEN|PASSWORD|SECRET|API_KEY|ACCESS_KEY", key, re.I)
+                 and len(value) >= 4)
+
+
+def redact_text(value, private_values=()):
+    text = str(value)
+    for private in sorted(set(private_values), key=len, reverse=True):
+        if private and len(private) >= 4:
+            text = text.replace(private, "[redacted]")
+    text = re.sub(r"(https?://)[^\s/]+@", r"\1[redacted]@", text)
+    text = re.sub(r'(https?://[^\s"?]+)\?[^\s"]+', r'\1?[redacted]', text)
+    text = re.sub(r'(?i)(bearer\s+)[\w.\-]+', r'\1[redacted]', text)
+    text = re.sub(
+        r'''(?im)((?:["']?[\w.-]*(?:token|password|secret|api[_-]?key|access[_-]?key|authorization)[\w.-]*["']?)\s*[:=]\s*)(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\r\n,}]+)''',
+        r'\1[redacted]', text,
+    )
+    return text
+
+
+def redact_value(value, private_values=()):
+    if isinstance(value, str):
+        return redact_text(value, private_values)
+    if isinstance(value, dict):
+        return {key: "[redacted]" if re.search(r"token|password|secret|api[_-]?key|access[_-]?key|authorization", str(key), re.I)
+                else redact_value(item, private_values) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item, private_values) for item in value]
+    return value
 
 
 def clean_env():
@@ -33,6 +68,11 @@ class Tools:
     def __init__(self, workdir):
         self.root = Path(workdir).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.cancel_event = None
+
+    def check_cancelled(self):
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise InterruptedError("Tool cancelled because the Worker stopped")
 
     def path(self, raw):
         p = Path(raw)
@@ -46,6 +86,7 @@ class Tools:
         if method is None:
             return f"Unsupported tool: {name}", True
         try:
+            self.check_cancelled()
             return method(args)
         except Exception as exc:
             return f"{type(exc).__name__}: {exc}", True
@@ -68,11 +109,26 @@ class Tools:
                 start_new_session=True,
             )
             try:
-                code = proc.wait(timeout=seconds)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-                code = 124
+                deadline = time.monotonic() + seconds
+                while True:
+                    self.check_cancelled()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        code = 124
+                        break
+                    try:
+                        code = proc.wait(timeout=min(.1, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            finally:
+                # Kill the whole command group on cancellation, including children.
+                if proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    proc.wait()
             out.seek(0)
             text = out.read(MAX_OUTPUT + 1).decode(errors="replace")
         return f"exit_code={code}\n{text[:MAX_OUTPUT]}", code != 0

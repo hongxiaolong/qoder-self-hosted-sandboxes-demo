@@ -33,3 +33,6 @@ service-account*.json
 .DS_Store
 .pytest_cache/
 .mypy_cache/
+
+# Local validation evidence may include real cloud resource identifiers.
+/docs/validation.md

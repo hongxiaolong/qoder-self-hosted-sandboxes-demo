@@ -1,16 +1,23 @@
-# Qoder Self-hosted Sandboxes Demo：报表分析 Agent
+# 实操指引：三轮引导与连续对话
+
+首次体验用项目根目录的 `./start.sh`，按 [README](../README.md) 六阶段完成。本文用于手动逐条执行和排障；所有命令在项目根目录运行。Web 只观察执行，消息由终端或 Qoder 控制台发送。
 
 ## 1. 安装依赖
+
+需要 Python 3.11+、已启动的 Docker 与 Buildx：
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[demo,build]"
+qoder-self-hosted-sandboxes-demo --help
 ```
 
-Python 使用 3.11+。镜像构建使用已启动的 Docker 和 Buildx。
+看到命令帮助即表示本机入口可用；尚未验证云端权限或创建资源。新开终端后需重新激活 `.venv`，或直接使用 `.venv/bin/qoder-self-hosted-sandboxes-demo`。
 
 ## 2. 配置连接
+
+已有配置时保留；`cp -n` 不覆盖：
 
 ```bash
 cp -n config/.env.example config/.env
@@ -19,7 +26,7 @@ cp -n config/registry.example.toml config/registry.toml
 chmod 600 config/.env config/.env.cloud
 ```
 
-填写 `config/.env`：
+`config/.env` 填 Qoder 国际站 PAT 和对应阿里云 Team 的 Key。默认地址如下，不能混用 E2B Cloud Key：
 
 ```dotenv
 QODER_ACCESS_TOKEN=<Qoder 国际站 PAT>
@@ -28,211 +35,134 @@ E2B_API_URL=https://api.cn-hangzhou.sandbox.aliyuncs.com
 E2B_DOMAIN=cn-hangzhou.sandbox.aliyuncs.com
 ```
 
-Qoder PAT 使用国际站账号创建；本例调用 `https://api.qoder.com/api/v1/cloud`。阿里云 Key 在 [杭州 Agent Sandbox 控制台](https://console.aliyun.com/sandbox/cn-hangzhou/overview) 对应 Team 的 API Keys 中创建。阿里云 Key 与 E2B Cloud Key 不可混用。
+`config/.env.cloud` 填 `ALIBABA_CLOUD_ACCESS_KEY_ID`、`ALIBABA_CLOUD_ACCESS_KEY_SECRET`；临时凭证另填 `ALIBABA_CLOUD_SECURITY_TOKEN`。AK 用于阿里云准备与模板管理，不注入 Worker。Qoder API 地址由 `config/app.toml` 配置，默认调用国际站。
 
-填写 `config/registry.toml`：
+`config/registry.toml` 填实际 ACR 仓库、地域、Team 和镜像拉取网络。`team_id` 必须与 Key 对应，不能仅凭 Team 名称认定相同：
 
 ```toml
 repository="<实例名>-registry.cn-hangzhou.cr.aliyuncs.com/sandboxhub/qoder-self-hosted-sandboxes-demo"
-instance_id=""
-vpc_id=""
-vswitch_id=""
-security_group_id=""
+instance_id="<ACR 企业版实例 ID>"
+vpc_id="<VPC ID>"
+vswitch_id="<vSwitch ID>"
+security_group_id="<安全组 ID>"
 region="cn-hangzhou"
-team_id="<与 E2B_API_KEY 相同的 Team ID>"
+team_id="<与 Key 对应的 Team ID>"
 ```
 
-这里 `sandboxhub` 是命名空间，`qoder-self-hosted-sandboxes-demo` 是本项目的私有镜像仓库，`analysis-<源码哈希>` 是镜像 tag。先在 ACR 创建对应命名空间和私有仓库，或替换为自己已有的路径。
+手动流程需事先准备私有命名空间和仓库，并在 ACR 绑定上述 VPC，等待 `RUNNING`。三个网络字段需一起填写，仅用于平台拉取镜像；公网 Docker 登录不能证明 VPC 拉取可用。自动查询、复用和写前确认可交给 `./start.sh`，见[账号准备](bootstrap.md)。
 
-在 ACR 控制台打开该实例的 **访问控制 → 专有网络**，添加本次使用的 VPC 绑定，等绑定状态为 **RUNNING** 后再构建模板。自动推导会读取已有绑定，不会替你创建 VPC 绑定；公网 Docker 登录成功不能证明平台已具备 VPC 拉取路径。
-
-这里的 VPC 参数用于 ACR 镜像拉取，不配置运行实例的 VPC 访问。`team_id` 必须属于当前账号并与 `E2B_API_KEY` 对应；Team 删除后重新创建，即使名称仍为 default，也要更新 ID。
-
-已有 Docker 登录直接复用，无需填写 `config/.env.registry`。若希望脚本自动登录，先执行 `cp -n config/.env.registry.example config/.env.registry`，再填写 `ACR_USERNAME`（ACR 登录用户名）和 `ACR_PASSWORD`（镜像仓库登录密码或临时 Token，不是阿里云 AK 或控制台登录密码）。脚本只读取 `config/.env.registry`，不会读取 `.example`；通过标准输入传递密码。仓库需要允许推送 Linux AMD64 镜像。
-
-`config/.env.cloud` 仅用于通过阿里云原生 OpenAPI 创建自定义模板：
-
-```dotenv
-ALIBABA_CLOUD_ACCESS_KEY_ID=<阿里云 AK ID>
-ALIBABA_CLOUD_ACCESS_KEY_SECRET=<阿里云 AK Secret>
-ALIBABA_CLOUD_SECURITY_TOKEN=
-```
-
-使用临时凭证时填写 Security Token。运行现成模板不需要把 AK 注入 Worker。账号需拥有对应 Team 的模板创建权限及 ACR 拉取条件。优先按镜像地址自动推导 ACR 实例和网络；如平台返回拉取网络错误，再填写实例 ID、VPC、vSwitch 与安全组。
+按 ACR 指引完成 Docker 登录。已有登录可复用；需要脚本登录时，复制 `config/.env.registry.example` 为 `config/.env.registry`，填写 `ACR_USERNAME`、`ACR_PASSWORD`，密码经标准输入传给 Docker。账号仍需具备服务开通、模板创建、仓库和网络权限；新建、购买与资源存续可能产生费用。
 
 ```bash
 qoder-self-hosted-sandboxes-demo doctor
 ```
 
-成功输出 `doctor_pass` 表示 Qoder 模型列表可访问，不打印凭证；Sandbox 接入由第 5 节单独验证。
+输出 `doctor_pass` 仅说明 Qoder 模型列表可访问；Sandbox、模板与 ACR 路径由后续步骤验证。真实凭证不提交，见 [SECURITY](../SECURITY.md)。
 
-## 3. 构建两个模板
+## 3. 准备模板
 
 ```bash
 qoder-self-hosted-sandboxes-demo templates browser
 qoder-self-hosted-sandboxes-demo templates analysis
 ```
 
-镜像、规格、启动命令、就绪检查统一在 `config/templates.toml` 配置。第一条使用官方 Browser 镜像，配置浏览器启动命令与 `/health` 就绪检查。第二条构建自定义分析镜像、复用 Docker 登录推送 ACR，再从 VPC 镜像地址创建二代模板并等待 `ready`。
+Browser 基于官方 Chromium 镜像；Analysis 构建含 Worker、Python 依赖与数据服务的自定义镜像，推送 ACR 后等待模板 `ready`。配置在 `config/templates.toml`，ID 与创建记录保存在 `var/state/templates.json`。
 
-模板 ID 写入 `var/state/templates.json`。在控制台「沙箱模板」可查到两个模板；分析模板的镜像地址应为自己的 ACR 仓库。两个构建命令每次都会创建新模板，已有就绪模板时无需重复构建。构建是环境准备操作，不计入下面 10 分钟演示。
+以上手动命令每次创建新模板。已有就绪且匹配源码的模板时无需重复；向导会先检查再决定是否构建。修改运行源码或镜像内容后重新构建分析模板。构建尚未返回 ID 就被中断，应先核对控制台，避免重复提交。
 
-镜像固化的运行依赖：E2B SDK、Playwright 客户端、pandas、Plotly、openpyxl；Chromium 在 Browser 模板内，分析镜像不重复安装浏览器。代码或 Dockerfile 修改后重新构建分析模板。
-
-## 4. 创建 Qoder 与 Sandbox 资源
+## 4. 创建运行并打开观察页
 
 ```bash
 qoder-self-hosted-sandboxes-demo setup
 qoder-self-hosted-sandboxes-demo status
 ```
 
-自定义实例先核对镜像中的运行代码与网页，检查服务是否已在运行；若未就绪直接报错，不在现场补启动。
+`setup` 创建两个 Sandbox，核对镜像源码与服务，上传并核对 Skill，创建 Agent、Self-hosted Environment、Session，随后在 Analysis 启动 Worker。看到 `setup_ready`、会话地址和两个不同的 Sandbox ID 后继续。`status` 是本地运行记录，不代替实时健康检查。
 
-输出 `setup_ready`、Qoder Session 地址、两个不同的 Sandbox ID 和创建耗时。默认实例存活 3600 秒，可在 `config/app.toml` 调整，受账号限制约束。
-
-在 Qoder 的 Agents、Environments、Skills、Sessions 页面查看本次资源。进入输出的 Session 地址发任务；无需在 Environment 的 Setup script 中输入任务。
-
-在阿里云杭州控制台对应 Team 的「沙箱实例」查看这两个 ID：Browser 实例使用 Browser 模板，Analysis 实例使用 ACR 自定义模板。
-
-另开终端：
+另开终端，激活 `.venv` 后运行：
 
 ```bash
-source .venv/bin/activate
 qoder-self-hosted-sandboxes-demo preview
 ```
 
-打开 [演示入口](http://127.0.0.1:8765)。左侧为云端 Chromium 画面和文件传递证据，右侧为分析看板。点击「打开 Qoder 发任务」进入本次 Session。
+打开输出的本机地址，默认 [http://127.0.0.1:8765](http://127.0.0.1:8765)。左侧选择当前 Session 的用户输入，主区看 QCA、Environment 与两个 Sandbox，右侧看调用详情；明暗主题保持相同布局，详见[观察页规范](live-observability.md)。没有报表或文件下载入口；每条已结束输入可回放已记录的事件，回放不重新执行任务。
 
-## 5. 查看 Agent 与执行环境（0:00–1:00）
+## 5. 核对本次使用的资源
 
-在 Qoder 的 Agents 页面打开本次报表分析 Agent，查看系统指令、工具和 `report-analysis` Skill。进入本次 Session，核对选择的 Agent 与 Self-hosted Environment。
+在页面查看“使用 Agent vN”、Skills、Session 与完整实例 ID，并与本轮终端输出核对。使用能够验证的 Session 地址进入 Qoder；其他资源通过控制台入口和复制 ID 查找，不根据 ID 猜测直达链接。
 
-在阿里云控制台对应 Team 的「沙箱实例」查看两个 ID：Browser 实例负责操作浏览器、下载报表；Analysis 实例负责执行分析代码、更新看板和生成文件。
+Analysis 运行 Worker 和 Python，Browser 单独运行 Chromium。Environment 表达 Analysis 执行端的逻辑映射；Agent Loop、WorkQueue 与 Session events 位于 QCA。不要在 Environment 的 Setup script 中输入任务。
 
-打开本机预览，左侧显示浏览器执行过程，右侧显示分析看板。后续任务都从同一 Qoder Session 发起。
+## 6. 第一轮：下载并分析
 
-## 6. 下载报表并分析（1:00–4:00）
-
-在 Qoder Session 点击 **Send Message**，输入以下内容并点击 **Send**：
-
-```text
-请使用 report-analysis Skill，从数据门户筛选 2026 年 10 月、华东地区的数据：真实操作浏览器、翻页并下载 CSV，传到分析 Sandbox。用你生成的 Python 按分类、地区和日期统计金额，发布交互看板并导出 CSV、Excel、JSON 和离线报告。报告实际行数、总金额和两个 Sandbox ID。
-```
-
-提交后在终端执行（只观察并验收，不重复发消息）：
-
-```bash
-qoder-self-hosted-sandboxes-demo observe --phase collect
-```
-
-页面与结果：
-
-1. 左侧 Chromium 选中月份与地区、翻到下一页、下载 CSV。
-2. 文件证据显示 Browser 路径、Analysis 路径和相同的 SHA-256。
-3. 右侧出现分类柱状图、每日趋势、数据行数和金额合计；鼠标悬停查看数据点。
-4. 点击 Excel 下载真实文件，Data 页查看原始记录，Categories 页查看分类汇总。
-
-默认合成数据应为 **100 行、45,392.18**；分类金额为计算 16,883.41、存储 15,835.75、网络 6,546.47、数据库 6,126.55。
-
-成功判定：`verification` 中检查项全部为 `true`，Qoder 任务结束；本地 `var/results/<run_id>/collect-verification.json` 保存独立核算结果。
-
-## 7. 连续追问（4:00–6:00）
-
-在同一 Qoder Session 发送：
-
-```text
-沿用已下载的数据，找出金额最高的分类并排除，重新计算分类、地区和日期汇总，发布新看板并更新导出文件。不要重新下载，不修改 input.csv。说明排除了哪个分类、剩余行数和总金额。
-```
-
-```bash
-qoder-self-hosted-sandboxes-demo observe --phase revise
-```
-
-成功判定：排除「计算」，剩余 **65 行、28,508.77**；看板版本增加、两个实例 ID 不变、`input.csv` 哈希不变。此轮执行的是新的分析代码，复用已下载文件，不重复采集。
-
-## 8. 现场追加（6:00–8:30）
-
-在同一 Session 发送：
-
-```text
-恢复展示所有分类。在当前 input.csv 追加一条记录：日期 2026-10-29，分类“现场演示”，地区“华东”，金额 6666。仅追加一次。重新生成并执行分析代码，发布看板并更新所有导出文件。报告与最初完整分析相比，行数与总金额的变化。
-```
-
-```bash
-qoder-self-hosted-sandboxes-demo observe --phase append
-```
-
-成功判定：**101 行、52,058.18**；柱状图新增「现场演示」6,666；输入哈希改变，原始数据源哈希不变。Excel 中也应有这条新增记录。全部验收成功后输出 `LIVE_PASS`。
-
-需要自由选择追加金额时，可修改消息；内置 `append` 验收固定检查 6,666，应同步调整验收条件。不要把不同金额的正确结果当作内置验收失败后强行跳过。
-
-## 9. 核对执行证据（8:30–10:00）
-
-```bash
-qoder-self-hosted-sandboxes-demo status
-qoder-self-hosted-sandboxes-demo verify --phase append
-```
-
-在控制台实例终端核对：
-
-Browser 实例：
-
-先在 Analysis 实例读取 `/workspace/evidence/transfer.json` 的 `browser_path`，再到 Browser 实例用 `ls -l <browser_path>` 查看实际下载文件。根据 Browser 镜像的下载行为，文件可能位于 `/tmp/report-analysis-<run_id>/` 或 `/home/user/browsertool/downloads/`。
-
-Analysis 实例：
-
-```bash
-ls -l /workspace/input.csv /workspace/analysis.py /workspace/artifacts
-cat /workspace/evidence/transfer.json
-cat /workspace/evidence/append.json
-```
-
-下载离线 HTML 和 Excel，核对看板版本、分类和金额。看板中的实例 ID、传递证据中的实例 ID、控制台中的实例 ID 应一致。
-
-## 10. 命令行完整复现
-
-不在 Qoder 页面发消息时，用以下命令提交同样三轮任务：
+在终端执行，命令发送 `config/demo.toml` 的第一轮消息，等待结束并独立验收：
 
 ```bash
 qoder-self-hosted-sandboxes-demo task --phase collect
+```
+
+消息要求按 2026 年 10 月、华东筛选合成数据，真实翻页、下载 CSV 并传给 Analysis，再运行生成的 Python、发布和导出。观察页显示实际工具请求、CDP 操作和结果回传；终端核对两端哈希和导出文件。默认 **100 条、45,392.18**，`verification` 全部为 `true` 才继续。
+
+## 7. 第二轮：连续追问
+
+```bash
 qoder-self-hosted-sandboxes-demo task --phase revise
+```
+
+沿用 `input.csv`，排除金额最高的分类并重新计算。默认排除“计算”，剩余 **65 条、28,508.77**；输入哈希不变，仍使用同一 Session 与两个实例。终端验收通过后再继续。
+
+## 8. 第三轮：追加记录
+
+```bash
 qoder-self-hosted-sandboxes-demo task --phase append
 ```
 
-`task` 与 `observe` 二选一，避免重复提交。`task` 会发送任务；`observe` 仅读取控制台刚发的一条新用户消息。等上一轮验收通过再发下一轮。
+恢复全部分类，在工作副本追加一条“现场演示”、金额 6,666 的记录，重新执行分析并更新产物。默认 **101 条、52,058.18**；原始数据源不变，仅增加一条记录。三轮全部验收通过后输出 `LIVE_PASS`。
 
-三轮原始提示词统一保存在 `config/demo.toml` 的 `[scenarios]`，可直接修改。以下从零创建并连续运行：
+三轮完整消息在 `config/demo.toml`。若改用 Qoder 控制台，逐轮复制该配置中的消息发送，再将对应命令换为 `observe --phase collect|revise|append`。同一轮只选 `task` 或 `observe`，等上一轮验收通过再提交；超时后用 `resume` 接续，尤其不要重复追加记录。
+
+## 9. 查看真实结果
 
 ```bash
-qoder-self-hosted-sandboxes-demo all --keep
+qoder-self-hosted-sandboxes-demo verify --phase append
 ```
 
-`--keep` 保留本次资源便于在控制台核对；省略时，进入任务阶段后会在流程结束时清理。若 `setup` 中途失败，仍需按下一节排障并回收已创建的资源。已有未回收资源时拒绝重复 `setup`。
+`verify` 重读远端文件核算，不再发任务，也不用来等待正在执行的任务。检查全部通过后，本地 `var/results/<run_id>/` 保存各轮验收 JSON、分析代码、Worker 记录、Excel 和浏览器截图；可直接打开 `analysis.xlsx` 核对数据。
+
+需要检查远端时，在 Analysis 实例查看 `/workspace/input.csv`、`/workspace/analysis.py`、`/workspace/artifacts/` 与 `/workspace/evidence/transfer.json`。Browser 下载文件的真实路径以 `transfer.json` 的 `browser_path` 为准。其余产物如需保留，应在释放实例前用文件 API 另行保存。
+
+## 10. 三轮后继续对话
+
+```bash
+qoder-self-hosted-sandboxes-demo chat
+qoder-self-hosted-sandboxes-demo chat --message "沿用当前 CSV，恢复全部分类，并解释计算过程。"
+```
+
+也可在同一 Qoder Session 发送；观察页只跟踪这些消息的执行。终端 `/back` 返回收尾，等待上一轮结束再继续。发送结果不明确时，先核对会话，再输入 `/retry` 或执行 `chat --retry` 沿用原消息编号重试；`/discard` 只放弃本地重试记录，不撤回消息。自由对话不套用默认三轮数字验收，发布产物仍需核算；显式 `verify --phase append` 仍检查第三轮固定规则。
+
+需要命令行从零连续执行三轮时，可用 `qoder-self-hosted-sandboxes-demo all --keep`；`--keep` 保留运行供核对，结束后仍需手动回收。已有未回收资源时，不重复 `setup`。
 
 ## 11. 排障与回收
 
-- **Unauthorized / Invalid API key**：先核对 `config/.env` 中的三个 E2B 变量；配置文件中的非空值优先于终端环境变量。阿里云 Key 连接阿里云 Endpoint，E2B Cloud Key 连接 E2B Cloud。不要把 Key 打印到演示屏幕。
-- **镜像推送连接中断**：检查本机 Docker 的代理与网络，恢复后重试构建；无需修改 Sandbox 的 VPC 或 Team 参数。
-- **自定义模板拉取失败**：核对杭州 ACR 企业版仓库、镜像 tag、同账号拉取权限与可用网络。按实际错误补齐 `instance_id` 或 VPC 字段。
-- **模板代码不一致**：重新运行分析模板构建；正式流程拒绝在旧镜像中临时覆盖源码来完成验证。
-- **采集失败**：运行 `qoder-self-hosted-sandboxes-demo logs`，核对 Browser `/health`、CDP、数据页代理和实际下载目录。工具已兼容官方下载扩展目录。
-- **页面被下载**：通过本机 `preview` 入口打开；云端网关可能给 HTML 添加附件响应头。本例代理保留鉴权并修正页面响应头。
-- **预览端口占用**：先在旧预览终端按 `Ctrl+C`；也可修改 `config/demo.toml` 的 `preview_port` 后重试。`cleanup` 不会关闭本机预览进程。
-- **任务超时**：运行 `qoder-self-hosted-sandboxes-demo resume` 接续读取已有任务，不再次提交追加记录。用 `logs` 查看 Worker；不要并行启动第二个 Worker。
-- **setup 中途失败**：先 `status` 查看已创建资源。仅在尚未记录任何 Qoder Skill、Agent、Environment、Session，且两个 Sandbox 服务已恢复时使用 `resume-setup`；若已记录任一 Qoder 资源，先 `cleanup`，再 `setup`。程序会拒绝覆盖已有 Qoder 资源记录。
-- **仅先验证工具链**：`qoder-self-hosted-sandboxes-demo setup --official-analysis` 显式使用官方分析模板，验证记录标记为 `official-development`，不代表 ACR 自定义镜像通过。
-- **实例到期**：下载结果后重新 `cleanup`、`setup`；本例没有持久卷，不承诺到期后的文件或进程恢复。
+- **授权或 Key 错误**：核对账号、Team 与 Endpoint。配置文件中的非空值优先于环境变量，不打印凭证排障。
+- **镜像推送中断**：检查 Docker 网络、代理或 VPN，再重跑；不要删除状态记录。权限和证书错误需先修正。
+- **模板拉取或源码核对失败**：检查 ACR 地域、镜像 tag、Team 与 VPC 拉取配置；源码变化后重建分析模板，不临时覆盖旧实例来完成验收。
+- **端口占用**：在原预览终端 `Ctrl+C`，或修改 `config/demo.toml` 的 `preview_port`。向导不会停止未知进程。
+- **观测不可用**：看具体字段的不可用或过期提示；不把队列查询失败当作空队列，不把断线当作实例已销毁。
+- **任务超时或提交结果不明确**：先查看 Qoder 会话和 `logs`；引导任务用 `resume` 接续，不重复提交。不要并行启动第二个 Worker。
+- **setup 中途失败**：先 `status`。仅在尚无 Qoder 资源记录且两套服务恢复时用 `resume-setup`；否则 `cleanup` 后重建。
+- **创建结果待核对**：创建前已保存 `pending_creates`。超时或断线不能证明云端未创建；向导不会重复创建，`cleanup` 会先处理已知资源，但不会输出 `cleanup_pass`。保留 `var/state/run.json`，在相同账号、地域和 Endpoint 按 `metadata.demo_run=<run_id>` 查找，Sandbox 另核对 `role=browser/analysis`。找到资源后将 ID 补入对应运行字段用于按归属清理；只有确认待核对资源不存在或已回收，才能清除对应 `pending_creates` 条目并重新执行 `cleanup`。不要删除账本或直接改为 `cleaned=true`。
+- **实例到期**：默认超时在 `config/app.toml`。Work 心跳不延长实例寿命；无持久卷，不承诺文件或进程恢复。
 
 ```bash
 qoder-self-hosted-sandboxes-demo cleanup
+# 需要进一步卸载准备资源时，在 cleanup 成功后执行
+.venv/bin/python scripts/bootstrap.py --uninstall
 ```
 
-该命令仅清理本次运行记录拥有的资源：停止工作、释放双实例、归档 Qoder Session/Agent/Environment、删除本次 Skill。ACR 镜像和两个模板保留复用，需要时在对应控制台按具体 ID 删除。
+`cleanup_pass` 表示本轮两个 Sandbox 和 Qoder 资源回收完成，镜像、模板及本地结果保留。卸载仅处理有归属记录的准备资源；未知模板保留并停止拆除依赖。ACR 购买项、默认 OSS 与共享服务角色不自动退订或删除，需另行核对费用。不要先删除 `var/state/`，本机预览由启动它的终端关闭。
 
 ## 参考资料
 
-- [Agent Sandbox 实操——E2B SDK 接入](https://alidocs.dingtalk.com/i/nodes/KGZLxjv9VGkoG9YwHqLDNyjPV6EDybno)：参考其依赖、代码、命令和成功判定结构。
-- [Agent 平台体验指引](https://alidocs.dingtalk.com/i/nodes/93NwLYZXWyxXroNzC07KqzkP8kyEqBQm)：参考其架构、界面操作与执行证据组织方式；本例未复现其中其他平台功能。
-- [通过 SDK 使用 Agent Sandbox](https://help.aliyun.com/zh/agent-sandbox/using-the-cloud-sandbox-via-the-sdk)
-- [使用 Browser Sandbox](https://help.aliyun.com/zh/agent-sandbox/use-browser-use-sandbox)
-- [通过代码构建自定义模板](https://help.aliyun.com/zh/agent-sandbox/build-and-manage-custom-templates-with-code)
+- [通过 SDK 使用 Agent Sandbox](https://help.aliyun.com/zh/agent-sandbox/using-the-cloud-sandbox-via-the-sdk)、[Browser Sandbox](https://help.aliyun.com/zh/agent-sandbox/use-browser-use-sandbox)、[通过代码构建模板](https://help.aliyun.com/zh/agent-sandbox/build-and-manage-custom-templates-with-code)。
+- 本指引的操作、成功判定与证据组织参考[Agent Sandbox 实操](https://alidocs.dingtalk.com/i/nodes/KGZLxjv9VGkoG9YwHqLDNyjPV6EDybno)和[Agent 平台体验指引](https://alidocs.dingtalk.com/i/nodes/93NwLYZXWyxXroNzC07KqzkP8kyEqBQm)，不表示本例复现其中其他平台能力。

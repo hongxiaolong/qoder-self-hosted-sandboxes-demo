@@ -4,7 +4,7 @@
 import json
 import time
 from qoder_self_hosted_sandboxes_demo.settings import save
-from .shared import api, connect, results, worker_logs, emit
+from .shared import api, bind_trace, connect, results, worker_logs, emit
 from .scenarios import prompt
 from .verification import verify
 
@@ -12,7 +12,7 @@ from .verification import verify
 def wait_turn(config, values, state, phase):
     if state.get(phase + "_done"):
         return
-    client = api(config, values)
+    client = bind_trace(api(config, values), state, values, mutations_only=True)
     box = connect(state, values)
     cursor = state.get(phase + "_cursor") or state[phase + "_message_id"]
     deadline = time.monotonic() + config["demo"]["turn_timeout_seconds"]
@@ -59,7 +59,7 @@ def task(config, values, state, phase, observe=False):
     previous = {"revise": "collect", "append": "revise"}.get(phase)
     if previous and not state.get(previous + "_verified"):
         raise ValueError("先完成上一轮任务及验收")
-    client = api(config, values)
+    client = bind_trace(api(config, values), state, values, mutations_only=True)
     if observe:
         events = list(
             client.events(

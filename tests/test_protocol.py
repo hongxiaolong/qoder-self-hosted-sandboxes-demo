@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -217,6 +218,10 @@ class WorkerProtocolTests(unittest.TestCase):
         )
         self.assertTrue(any(r.endswith("/work/work_a/stop") for r in self.requests))
         self.assertEqual((Path(self.temp.name) / "counter").read_text(), "1")
+        records = [json.loads(line) for line in (self.worker.state_dir / 'worker.jsonl').read_text().splitlines()]
+        self.assertEqual(next(e for e in records if e['kind']=='work_poll')['state'],'queued')
+        self.assertEqual(next(e for e in records if e['kind']=='work_ack')['state'],'starting')
+        self.assertEqual(next(e for e in records if e['kind']=='heartbeat_confirmed')['ttl_seconds'],60)
 
     def test_custom_tool_returns_custom_result_contract(self):
         class EchoTools(Tools):
@@ -269,6 +274,98 @@ class WorkerProtocolTests(unittest.TestCase):
         with self.assertRaises(APIError) as caught:
             self.api.request("GET", "/redirect")
         self.assertEqual(caught.exception.status, 302)
+
+
+class WorkerLeaseSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+        class LeaseAPI:
+            token = 'private-api-credential'
+            posts = []
+            heartbeat = None
+
+            def request(self, method, path, **kwargs):
+                if self.heartbeat is not None:
+                    return self.heartbeat
+                raise RuntimeError('lease heartbeat failed')
+
+            def send(self, *args):
+                self.posts.append(args)
+
+        self.api = LeaseAPI()
+        self.worker = Worker(self.api,'env','session','worker',self.root,self.root/'state')
+        self.worker.calls['tool'] = dict(id='tool',type='agent.tool_use',name='Bash',
+                                         evaluated_permission='allow',input={'command':'touch started; sleep 30; touch completed'})
+        self.worker.pending.add('tool')
+        self.worker.work_id = 'work'
+
+    def records(self):
+        return [json.loads(line) for line in (self.worker.state_dir/'worker.jsonl').read_text().splitlines()]
+
+    def run_cancellation(self):
+        dispatch = threading.Thread(target=self.worker.dispatch)
+        with redirect_stdout(io.StringIO()):
+            dispatch.start()
+            try:
+                deadline = time.monotonic()+3
+                while not (self.root/'started').exists() and time.monotonic()<deadline:
+                    time.sleep(.01)
+                self.assertTrue((self.root/'started').exists(),'Bash did not begin executing')
+                self.worker.heartbeats()
+                dispatch.join(3)
+            finally:
+                self.worker.stopping.set()
+                dispatch.join(3)
+        self.assertFalse(dispatch.is_alive())
+        self.assertFalse((self.root/'completed').exists())
+        self.assertEqual(self.api.posts,[])
+        records = self.records()
+        self.assertIn('tool_cancelled',[record['kind'] for record in records])
+        self.assertNotIn('tool_posted',[record['kind'] for record in records])
+
+    def test_heartbeat_failure_cancels_running_bash_and_never_posts_result(self):
+        self.run_cancellation()
+        self.assertIsNotNone(self.worker.lease_error)
+        self.assertIn('heartbeat_failed',[record['kind'] for record in self.records()])
+
+    def test_remote_stopped_work_cancels_running_bash_and_never_posts_result(self):
+        self.api.heartbeat={'state':'stopped'}
+        self.run_cancellation()
+        self.assertIn('heartbeat_stopped',[record['kind'] for record in self.records()])
+
+    def test_worker_log_redacts_captured_credentials_even_after_environment_removal(self):
+        with patch.dict(os.environ,{'E2B_API_KEY':'opaque-e2b-credential'}):
+            worker = Worker(self.api,'env','session','worker',self.root,self.root/'safe-state')
+        with redirect_stdout(io.StringIO()):
+            worker.log('tool_finished',input={'token':'unrecognized-secret'},
+                       output='private-api-credential opaque-e2b-credential password="alpha,beta" https://user:password@example.test/file')
+        text = (worker.state_dir/'worker.jsonl').read_text()
+        for value in ['private-api-credential','opaque-e2b-credential','unrecognized-secret','alpha','beta','user:password']:
+            self.assertNotIn(value,text)
+
+    def test_log_records_claimed_work_and_preserves_explicit_poll_work(self):
+        with redirect_stdout(io.StringIO()):
+            self.worker.log('tool_start',tool_use_id='tool')
+            self.worker.log('work_poll',work_id='work-polled')
+        records=self.records()
+        self.assertEqual(records[0]['work_id'],'work')
+        self.assertEqual(records[1]['work_id'],'work-polled')
+
+    def test_tool_message_parent_prefers_explicit_id_over_latest_user_message(self):
+        feed=[dict(id='msg1',type='user.message'),dict(id='msg2',type='user.message'),
+              dict(id='call1',type='agent.tool_use',message_id='msg1',name='Read',input={'file_path':'input.csv'}),
+              dict(id='call2',type='agent.tool_use',name='Read',input={'file_path':'input.csv'})]
+        self.api.events=lambda *args:iter(feed)
+        with redirect_stdout(io.StringIO()):
+            self.worker.reconcile()
+        self.assertEqual(self.worker.call_messages['call1'],'msg1')
+        self.assertEqual(self.worker.call_messages['call2'],'msg2')
+        records={record['tool_use_id']:record for record in self.records() if record['kind']=='tool_observed'}
+        self.assertEqual(records['call1']['message_id'],'msg1')
+        self.assertEqual(records['call2']['message_id'],'msg2')
 
 
 if __name__ == "__main__":

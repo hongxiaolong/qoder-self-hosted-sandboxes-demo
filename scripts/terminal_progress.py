@@ -14,10 +14,31 @@ from pathlib import Path
 import queue
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
+
+
+def display_width(text):
+    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def fit_line(text, columns):
+    """Leave a spare column so an updating line never wraps the terminal."""
+    limit = max(0, columns - 1)
+    if display_width(text) <= limit:
+        return text
+    result, used = [], 0
+    for char in text:
+        width = display_width(char)
+        if used + width > max(0, limit - 1):
+            break
+        result.append(char)
+        used += width
+    return "".join(result) + ("…" if limit else "")
 
 
 def clean_output(line):
@@ -123,7 +144,14 @@ def run_command(command, log_path, label="安装项目依赖", stream=None, tty=
             position = 16 - position
         bar = "─" * position + "━━━" + "─" * (8 - position)
         elapsed = int(time.monotonic() - started)
-        stream.write("\r\033[2K  " + frames[frame % len(frames)] + " [" + bar + "] " + current + " · " + str(elapsed) + "s")
+        columns = shutil.get_terminal_size((80, 24)).columns
+        prefix = "  " + frames[frame % len(frames)] + " "
+        if columns >= 50:
+            prefix += "[" + bar + "] "
+        suffix = " · " + str(elapsed) + "s"
+        available = max(0, columns - 1 - display_width(prefix + suffix))
+        text = prefix + fit_line(current, available + 1) + suffix
+        stream.write("\r\033[2K" + fit_line(text, columns))
         stream.flush()
 
     print("  " + label, file=stream, flush=True)

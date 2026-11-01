@@ -35,18 +35,20 @@ from qoder_self_hosted_sandboxes_demo.qoder import (
     sessions,
     skills,
 )
-from .shared import api, connect, emit
+from .shared import api, bind_trace, connect, emit, cleanup_sandbox
 from .session import task, wait_turn
 from .verification import verify
 from .tool_specs import TOOLS
 from .data import seed_csv, sha
+from .lifecycle import record_created, begin_create, pending_creation_error, require_confirmed_creations
 
 
 def setup(config, values, official_analysis=False):
-    if state_file().exists() and not json.loads(state_file().read_text()).get(
-        "cleaned"
-    ):
-        raise ValueError("存在未回收资源，请先 status 查看或 cleanup")
+    if state_file().exists():
+        previous = json.loads(state_file().read_text())
+        require_confirmed_creations(previous)
+        if not previous.get("cleaned"):
+            raise ValueError("存在未回收资源，请先 status 查看或 cleanup")
     templates_path = STATE_DIR / "templates.json"
     templates = (
         json.loads(templates_path.read_text()) if templates_path.exists() else {}
@@ -81,6 +83,9 @@ def setup(config, values, official_analysis=False):
     for key in ["browser_template_name", "browser_image", "analysis_template_name", "analysis_image"]:
         state[key] = templates.get(key) if not official_analysis or key.startswith("browser_") else None
     save(state)
+    bind_trace(client, state, values)
+    begin_create(state, "browser", save)
+    browser_started_at, browser_started = time.time(), time.monotonic()
     browser = create_sandbox(
         templates["browser_template"],
         config["sandbox"]["timeout_seconds"],
@@ -88,8 +93,12 @@ def setup(config, values, official_analysis=False):
         values,
     )
     state["browser_sandbox_id"] = browser.sandbox_id
+    record_created(state, "browser", browser.sandbox_id, sdk_create=dict(
+        started_at=browser_started_at, finished_at=time.time(),
+        elapsed_ms=round((time.monotonic() - browser_started) * 1000, 1)))
     save(state)
-    started = time.monotonic()
+    begin_create(state, "analysis", save)
+    started_at, started = time.time(), time.monotonic()
     analysis_box = create_sandbox(
         analysis,
         config["sandbox"]["timeout_seconds"],
@@ -99,6 +108,8 @@ def setup(config, values, official_analysis=False):
     )
     state["analysis_sandbox_id"] = analysis_box.sandbox_id
     state["analysis_create_ms"] = round((time.monotonic() - started) * 1000, 1)
+    record_created(state, "analysis", analysis_box.sandbox_id, sdk_create=dict(
+        started_at=started_at, finished_at=time.time(), elapsed_ms=state["analysis_create_ms"]))
     save(state)
     if not analysis_box.traffic_access_token:
         raise RuntimeError(
@@ -137,7 +148,7 @@ def setup(config, values, official_analysis=False):
         p
         for p in (ROOT / "src").rglob("*")
         if p.is_file()
-        and p.suffix in {".py", ".html", ".css", ".js", ".svg"}
+        and (p.suffix in {".py", ".html", ".css", ".js", ".svg", ".png"} or p.name == "NOTICE.md")
         and "__pycache__" not in p.parts
     ]
     if state["analysis_mode"] != "custom_image":
@@ -207,6 +218,7 @@ def setup(config, values, official_analysis=False):
 
 
 def finish_setup(config, values, state, analysis_box, browser):
+    require_confirmed_creations(state)
     if any(
         state.get(key)
         for key in ("skill_id", "agent_id", "environment_id", "session_id")
@@ -220,7 +232,7 @@ def finish_setup(config, values, state, analysis_box, browser):
         )
     run_id = state["run_id"]
     skill_name = Path(config["agent"]["skill_dir"]).name
-    client = api(config, values)
+    client = bind_trace(api(config, values), state, values)
     browser_host = browser.get_host(3000)
     browser_token = browser._envd_access_token
     health = command(browser, "curl -fsS http://127.0.0.1:3000/health", timeout=15)
@@ -254,17 +266,23 @@ def finish_setup(config, values, state, analysis_box, browser):
 
     def skill_created(item):
         state.update(skill_id=item["id"], skill_version=item["latest_version"])
+        record_created(state, "skill", item["id"], item)
         save(state)
 
+    begin_create(state, "skill", save)
     skill, downloaded = skills.upload(
         client, run_id, skill_name, skill_dir / "SKILL.md", on_created=skill_created
     )
     analysis_box.files.write(state["skill_path"], downloaded)
+    begin_create(state, "agent", save)
     agent = agents.create(
         client, config["agent"], TOOLS, skill, state["skill_path"], run_id
     )
     state["agent_id"] = agent["id"]
+    state["agent_version"] = agent["version"]
+    record_created(state, "agent", agent["id"], agent)
     save(state)
+    begin_create(state, "environment", save)
     env = environments.create(
         client,
         config["project"]["name"] + "-" + run_id,
@@ -272,9 +290,12 @@ def finish_setup(config, values, state, analysis_box, browser):
         config["environment"],
     )
     state["environment_id"] = env["id"]
+    record_created(state, "environment", env["id"], env)
     save(state)
+    begin_create(state, "session", save)
     session = sessions.create(client, agent, env, run_id, "报表分析 Agent " + run_id)
     state["session_id"] = session["id"]
+    record_created(state, "session", session["id"], session)
     state["session_url"] = "https://qoder.com/cloud/sessions/" + session["id"]
     save(state)
     identity = {
@@ -295,6 +316,7 @@ def finish_setup(config, values, state, analysis_box, browser):
         "/workspace/identity.json", json.dumps(identity, ensure_ascii=False)
     )
     worker_config = {
+        "run_id": run_id,
         "base_url": state["qoder_url"],
         "environment_id": env["id"],
         "session_id": session["id"],
@@ -360,12 +382,16 @@ def finish_setup(config, values, state, analysis_box, browser):
 
 
 def cleanup(config, values, state):
-    client = api(config, values)
+    pending_error = pending_creation_error(state)
+    if pending_error:
+        state["cleaned"] = False
+        save(state)
+    client = bind_trace(api(config, values), state, values)
     errors = sessions.cleanup_owned(client, state, save)
     for key in ["analysis_sandbox_id", "browser_sandbox_id"]:
         if state.get(key) and not state.get(key + "_killed"):
             try:
-                connect(state, values, key).kill()
+                cleanup_sandbox(state, values, key)
                 state[key + "_killed"] = True
                 save(state)
             except NotFoundException:
@@ -373,6 +399,8 @@ def cleanup(config, values, state):
                 save(state)
             except Exception as exc:
                 errors.append(str(exc))
+    if pending_error:
+        errors.append("已按归属处理已知资源；" + pending_error)
     if errors:
         raise RuntimeError("清理未完成：" + " | ".join(errors))
     state["cleaned"] = True
@@ -390,12 +418,16 @@ def main(argv=None, *, prog=None):
         "--phase", choices=["collect", "revise", "append"], default="collect"
     )
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--message", help="chat：发送一条自由对话消息后等待回复")
+    parser.add_argument("--retry", action="store_true", help="chat：沿用本机待确认消息编号重试，不重复生成消息")
     parser.add_argument(
         "--official-analysis",
         action="store_true",
         help="仅用于开发验证；不代表自定义镜像已验证",
     )
     args = parser.parse_args(argv)
+    if args.retry and (args.message is not None or args.action != "chat"):
+        parser.error("--retry 仅用于 chat，且不能与 --message 同时使用")
     values = {}
     try:
         config, values = load()
@@ -408,6 +440,7 @@ def main(argv=None, *, prog=None):
             return
         if args.action == "resume-setup":
             current = state_for(config, values)
+            require_confirmed_creations(current)
             finish_setup(
                 config,
                 values,
@@ -417,32 +450,61 @@ def main(argv=None, *, prog=None):
             )
             return
         if args.action == "all":
-            state = setup(config, values, args.official_analysis)
+            previous_run_id = (
+                json.loads(state_file().read_text()).get("run_id")
+                if state_file().exists() else None
+            )
+            state = None
+            original_error = None
             try:
+                state = setup(config, values, args.official_analysis)
                 for phase in ["collect", "revise", "append"]:
                     task(config, values, state, phase)
+            except BaseException as exc:
+                original_error = exc
+                raise
             finally:
                 if not args.keep:
-                    cleanup(config, values, state)
+                    try:
+                        # setup saves each created resource before continuing;
+                        # an exception can occur before it returns that state.
+                        current = state
+                        if current is None and state_file().exists():
+                            current = state_for(config, values)
+                        if (current and current.get("run_id")
+                                and current["run_id"] != previous_run_id
+                                and not current.get("cleaned")):
+                            cleanup(config, values, current)
+                    except BaseException as cleanup_error:
+                        if original_error is None:
+                            raise
+                        original_error.add_note("本轮自动回收未完成，运行账本保留。")
+                        emit("cleanup_failed", error=safe_error(cleanup_error, values))
             return
         state = state_for(config, values)
         if args.action == "preview":
             from .preview import serve
             from .demo_status import DemoStatus
+            from .conversation import observer
             from qoder_self_hosted_sandboxes_demo.qoder.client import API
             import asyncio
 
             asyncio.run(
                 serve(
-                    json.loads((STATE_DIR / "gateway.json").read_text()),
+                    {**json.loads((STATE_DIR / "gateway.json").read_text()),
+                     "sandbox_region": values["E2B_DOMAIN"].split(".")[0]},
                     config["demo"]["preview_port"],
                     DemoStatus(
                         state_file(), state["analysis_url"],
                         API(config["qoder"]["base_url"], values["QODER_ACCESS_TOKEN"], timeout=3),
                         config["scenarios"], config["sandbox"]["timeout_seconds"],
                     ),
+                    observer(config, values, state),
                 )
             )
+        elif args.action == "chat":
+            from .conversation import chat
+            chat(config, values, state, args.message, retry=args.retry)
         elif args.action in ["task", "observe"]:
             task(config, values, state, args.phase, args.action == "observe")
         elif args.action == "resume":

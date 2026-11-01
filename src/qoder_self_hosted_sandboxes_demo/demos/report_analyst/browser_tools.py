@@ -22,12 +22,14 @@ class WebTools(AnalysisTools):
         self.credentials = credentials
         self.playwright = None
         self.browser = None
+        self.observe = lambda *_args, **_values: None
 
     def tool_download_report(self, args):
         from qoder_self_hosted_sandboxes_demo.sandbox.client import Sandbox
         from playwright.sync_api import sync_playwright
 
         config = self.browser_config
+        self.observe("browser_connect", role="browser", detail="Worker 通过 CDP 连接 Chromium")
         opts = dict(
             api_key=self.credentials["E2B_API_KEY"],
             api_url=config["api_url"],
@@ -63,6 +65,7 @@ class WebTools(AnalysisTools):
             )
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
+                self.check_cancelled()
                 try:
                     if (
                         remote.commands.run(
@@ -77,6 +80,7 @@ class WebTools(AnalysisTools):
             else:
                 raise TimeoutError("Browser source proxy did not become ready")
         if self.playwright is None:
+            self.check_cancelled()
             self.playwright = sync_playwright().start()
             self.browser = self.playwright.chromium.connect_over_cdp(
                 config["cdp_url"],
@@ -115,6 +119,8 @@ class WebTools(AnalysisTools):
         page.goto(
             "http://127.0.0.1:8088/source", wait_until="networkidle", timeout=30000
         )
+        self.check_cancelled()
+        self.observe("browser_filter", role="browser", detail="在网页选择筛选条件")
         page.locator("#month").select_option(args.get("month", "2026-10"))
         page.locator("#region").select_option(args.get("region", "华东"))
         page.get_by_role("button", name="应用筛选", exact=True).click()
@@ -123,12 +129,14 @@ class WebTools(AnalysisTools):
         time.sleep(0.8)
         page.screenshot(path=str(self.root / "artifacts/browser-frame.png"))
         page.get_by_role("button", name="下一页", exact=True).click()
+        self.observe("browser_download", role="browser", detail="翻页并通过 Chromium 下载 CSV")
         page.wait_for_function("!document.body.dataset.loading")
         time.sleep(0.8)
         page.get_by_role("link", name="下载筛选后的 CSV", exact=True).click()
         deadline = time.monotonic() + 25
         data = None
         while time.monotonic() < deadline:
+            self.check_cancelled()
             for candidate in candidates:
                 try:
                     data = remote.files.read(candidate, format="bytes")
@@ -153,6 +161,8 @@ class WebTools(AnalysisTools):
         if not rows:
             raise ValueError("The selected data set is empty")
         dest = self.root / "input.csv"
+        self.check_cancelled()
+        self.observe("csv_transfer", role="transfer", detail="从 Browser Sandbox 读取 CSV，写入 Analysis Sandbox")
         dest.write_bytes(data)
         page.screenshot(path=str(self.root / "artifacts/browser.png"))
         evidence = {

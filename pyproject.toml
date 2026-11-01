@@ -23,4 +23,4 @@ qoder-self-hosted-sandboxes-demo="qoder_self_hosted_sandboxes_demo.cli:main"
 where=["src"]
 
 [tool.setuptools.package-data]
-"qoder_self_hosted_sandboxes_demo.demos.report_analyst"=["web/*.html","web/*.css","web/*.js","web/*.svg"]
+"qoder_self_hosted_sandboxes_demo.demos.report_analyst"=["web/*.html","web/*.css","web/*.js","web/*.svg","web/*.png","web/icons/*.svg","web/icons/*.md"]

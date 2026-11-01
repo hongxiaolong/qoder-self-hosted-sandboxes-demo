@@ -10,6 +10,7 @@ DEMO_ACTIONS = {
     "setup": "创建演示资源",
     "resume-setup": "接续未完成的资源准备",
     "preview": "启动本机演示预览",
+    "chat": "在同一会话继续自由对话",
     "task": "提交并验收一轮任务",
     "observe": "观察并验收已提交的任务",
     "resume": "接续观察当前任务",

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import bootstrap as b
+from qoder_self_hosted_sandboxes_demo.sandbox import templates as template_builder
 
 
 class Account:
@@ -165,6 +166,56 @@ class BootstrapTests(unittest.TestCase):
         fresh = b.Bootstrap(self.root, cloud)
         self.assertNotEqual(instance.state["id"], fresh.state["id"])
 
+    def test_template_rebuild_preserves_creation_receipts_and_legacy_ids(self):
+        saved = {"browser_template": "legacy-browser"}
+        scope = {"team_id": "team-1", "region": "cn-hangzhou"}
+        template_builder.record_created(saved, "browser", "new-browser", scope)
+        saved["browser_template"] = "new-browser"
+        template_builder.record_created(saved, "browser", "next-browser", scope)
+        records = saved["created_templates"]
+        self.assertEqual([r["template_id"] for r in records], ["legacy-browser", "new-browser", "next-browser"])
+        self.assertNotIn("created_by_demo", records[0])
+        self.assertEqual(records[1]["team_id"], "team-1")
+        self.assertEqual(records[2]["region"], "cn-hangzhou")
+        with patch.object(template_builder, "STATE_DIR", self.root / "var/state"):
+            template_builder.store(saved)
+            self.assertEqual(template_builder.state(), saved)
+
+    def test_uninstall_cleans_all_recorded_templates_and_accepts_not_found(self):
+        cloud = Account()
+        instance = b.Bootstrap(self.root, cloud)
+        instance.record("team", {"teamID": "team-1"})
+        saved = {}
+        scope = {"team_id": "team-1", "region": cloud.region}
+        for identity in ("old-analysis", "new-analysis"):
+            template_builder.record_created(saved, "analysis", identity, scope)
+            saved["analysis_template"] = identity
+        b.atomic_json(self.root / "var/state/templates.json", saved)
+        missing = RuntimeError("already removed")
+        missing.status_code = 404
+        with patch("alibabacloud_sandbox20260820.client.Client") as client, patch.object(cloud, "config", return_value=None, create=True), patch("builtins.input", return_value="uninstall"):
+            client.return_value.delete_template.side_effect = [missing, None]
+            instance.uninstall()
+        self.assertEqual([call.args[0] for call in client.return_value.delete_template.call_args_list], ["old-analysis", "new-analysis"])
+        stored = b.ui.read_json(self.root / "var/state/templates.json")
+        self.assertNotIn("analysis_template", stored)
+        self.assertTrue(all(record["deleted"] for record in stored["created_templates"]))
+        self.assertTrue(instance.state["uninstalled"])
+
+    def test_uninstall_retains_unclaimed_or_wrong_scope_templates_and_dependencies(self):
+        cloud = Account()
+        instance = b.Bootstrap(self.root, cloud)
+        instance.record("team", {"teamID": "team-1"}, True)
+        instance.record("repository", {"InstanceId": "cri-1", "RepoId": "repo-1"}, True)
+        for history in ([], [{"template_id": "unknown", "created_by_demo": True, "team_id": "team-1", "region": "other-region"}], [{"template_id": "unknown", "created_by_demo": True, "team_id": "other-team", "region": cloud.region}]):
+            with self.subTest(history=history):
+                b.atomic_json(self.root / "var/state/templates.json", {"analysis_template": "unknown", "created_templates": history})
+                with patch("alibabacloud_sandbox20260820.client.Client") as client, patch("builtins.input", return_value="uninstall"), self.assertRaisesRegex(b.CloudError, "模板归属记录不完整"):
+                    instance.uninstall()
+                client.assert_not_called()
+                self.assertEqual(cloud.writes, [])
+                self.assertNotIn("uninstalled", instance.state)
+
     def test_unknown_write_is_never_automatically_replayed(self):
         instance = b.Bootstrap(self.root, Account())
         with patch("builtins.input", return_value="yes"):
@@ -187,9 +238,26 @@ class BootstrapTests(unittest.TestCase):
 
     def test_decline_creates_neither_operation_nor_resource(self):
         instance = b.Bootstrap(self.root, Account())
-        with patch("builtins.input", return_value="no"), self.assertRaises(SystemExit):
+        with patch("builtins.input", side_effect=["", "no", "YES", KeyboardInterrupt]), self.assertRaises(KeyboardInterrupt):
             instance.mutate("x", "test", lambda _: self.fail("executed"))
         self.assertEqual(instance.state["operations"], {})
+
+    def test_only_explicit_approval_runs_mutation_after_empty_and_invalid_input(self):
+        instance = b.Bootstrap(self.root, Account())
+        writes = []
+        def answer(_prompt):
+            self.assertEqual(writes, [])
+            return next(answers)
+        answers = iter(["", "no", "y", "yes"])
+        with patch("builtins.input", side_effect=answer):
+            instance.mutate("x", "test", lambda _: writes.append("executed") or {})
+        self.assertEqual(writes, ["executed"])
+
+    def test_purchase_and_uninstall_require_their_exact_approval_word(self):
+        for word in ("purchase", "uninstall"):
+            with self.subTest(word=word), patch("builtins.input", side_effect=["", "yes", "typo", word]) as read:
+                b.confirm("test", word)
+                self.assertEqual(read.call_count, 4)
 
     def test_reused_resource_does_not_inherit_ownership_from_another_id(self):
         instance = b.Bootstrap(self.root, Account())

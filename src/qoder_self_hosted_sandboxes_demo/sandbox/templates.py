@@ -11,8 +11,10 @@ import argparse
 from collections import deque
 import hashlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 import tomllib
 
@@ -47,7 +49,27 @@ def state():
 def store(data):
     p = STATE_DIR / "templates.json"
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    descriptor, temporary = tempfile.mkstemp(prefix=".templates-", dir=p.parent)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(data, output, ensure_ascii=False, indent=2)
+        os.replace(temporary, p)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def record_created(saved, kind, template_id, scope):
+    """Preserve every created ID; legacy IDs remain explicitly unclaimed."""
+    history = saved.setdefault("created_templates", [])
+    previous = saved.get(kind + "_template")
+    if previous and not any(item.get("template_id") == previous for item in history):
+        history.append({"kind": kind, "template_id": previous})
+    record = {"kind": kind, "template_id": template_id,
+              "team_id": scope.get("team_id"), "region": scope.get("region"),
+              "created_by_demo": True}
+    if not any(item == record for item in history):
+        history.append(record)
 
 
 def source_digest(root=ROOT):
@@ -57,8 +79,8 @@ def source_digest(root=ROOT):
         for path in sorted((root / directory).rglob("*")):
             if (
                 path.is_file()
-                and (path.suffix in {".py", ".html", ".css", ".js", ".svg", ".txt"}
-                     or path.name == "Dockerfile")
+                and (path.suffix in {".py", ".html", ".css", ".js", ".svg", ".png", ".txt"}
+                     or path.name in {"Dockerfile", "NOTICE.md"})
                 and "__pycache__" not in path.parts
             ):
                 digest.update(str(path.relative_to(root)).encode())
@@ -136,6 +158,8 @@ def browser():
     _, values = load(required=["E2B_API_KEY", "E2B_API_URL", "E2B_DOMAIN"])
     cfg = profile("browser")
     saved = state()
+    registry_path = CONFIG_DIR / "registry.toml"
+    scope = tomllib.loads(registry_path.read_text()) if registry_path.exists() else {}
     template_name = build_name("browser", cfg)
     build = Template.build(
         Template().from_image(cfg["image"]),
@@ -149,6 +173,7 @@ def browser():
         },
         **{**opts(values), "request_timeout": 600},
     )
+    record_created(saved, "browser", build.template_id, scope)
     saved["browser_template"] = build.template_id
     saved["browser_template_name"] = template_name
     saved["browser_image"] = cfg["image"]
@@ -263,6 +288,7 @@ def analysis():
         )
         tid = result.body.template_id
         saved = state()
+        record_created(saved, "analysis", tid, resources)
         saved.pop("analysis_build_error", None)
         saved.update(
             analysis_template=tid,

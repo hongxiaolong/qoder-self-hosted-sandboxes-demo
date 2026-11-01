@@ -5,6 +5,14 @@ description: Collect a filtered CSV through the cloud browser, analyze the downl
 
 # Interactive report analysis
 
+Interpret each message in the context of the existing conversation and files. The
+three onboarding prompts are examples, not a fixed turn-based protocol. Decide
+which tools, if any, are needed for the user's current intent. Ask for missing
+information rather than guessing a write operation. Explanations can use already
+observed results without downloading, recomputing, publishing, or appending.
+
+For requests that require collecting or updating an analysis:
+
 1. Call `runtime_evidence` to identify the analysis workspace and both Sandbox IDs. Read this skill file using the supplied path.
 2. For a new collection request, call `download_report` with the requested month and region. This tool operates the Browser Sandbox and explicitly transfers its downloaded CSV to `input.csv` in the analysis workspace. Continue when it returns matching source and target hashes and a nonzero row count.
 3. Use `run_python` to write and execute your own Python analysis against `input.csv`. Use pandas. Write `analysis.json` in the current directory with these fields:

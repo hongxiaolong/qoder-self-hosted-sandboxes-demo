@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import gzip
+import copy
 import json
 import time
 import urllib.error
@@ -23,10 +24,11 @@ class APIError(RuntimeError):
 
 
 class API:
-    def __init__(self, base_url, token, timeout=15):
+    def __init__(self, base_url, token, timeout=15, observer=None):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self.observer = observer
 
         # API credentials must not follow an HTTP redirect to another host.
         class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -52,24 +54,12 @@ class API:
         attempts = 3 if method == "GET" else 1
         for attempt in range(attempts):
             try:
-                with self.opener.open(req, timeout=self.timeout) as response:
-                    result = response.read(4 * 1024 * 1024 + 1)
-                    if len(result) > 4 * 1024 * 1024:
-                        raise ValueError("API response exceeded demo limit (4 MiB)")
-                    if response.headers.get("Content-Encoding") == "gzip":
-                        result = gzip.decompress(result)
-                return result if raw else json.loads(result) if result else None
-            except urllib.error.HTTPError as exc:
-                message = (
-                    exc.read(4096)
-                    .decode(errors="replace")
-                    .replace(self.token, "[REDACTED]")
-                )
-                exc.close()
-                if exc.code in (429, 502, 503, 504) and attempt + 1 < attempts:
+                return self._attempt(req, path, body, query, raw, attempt + 1)
+            except APIError as exc:
+                if exc.status in (429, 502, 503, 504) and attempt + 1 < attempts:
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                raise APIError(exc.code, message[:1200]) from None
+                raise
             except (urllib.error.URLError, TimeoutError):
                 if attempt + 1 < attempts:
                     time.sleep(0.5 * (attempt + 1))
@@ -77,6 +67,64 @@ class API:
                 raise RuntimeError(
                     "Qoder network request failed or timed out"
                 ) from None
+
+    def _attempt(self, req, path, body, query, raw, attempt):
+        """Observe exactly the transport attempt, excluding retry backoff.
+
+        The callback is a trusted in-process consumer; it sees actual payloads.
+        Persistent consumers must project/redact them (see APITraceRecorder).
+        """
+        started_at, started = time.time(), time.monotonic()
+        status, response_headers, payload, state = None, {}, None, "error"
+        try:
+            try:
+                with self.opener.open(req, timeout=self.timeout) as response:
+                    status = getattr(response, "status", None)
+                    if status is None:
+                        status = response.getcode()
+                    response_headers = dict(response.headers.items())
+                    result = response.read(4 * 1024 * 1024 + 1)
+                    if len(result) > 4 * 1024 * 1024:
+                        raise ValueError("API response exceeded demo limit (4 MiB)")
+                    if response.headers.get("Content-Encoding") == "gzip":
+                        result = gzip.decompress(result)
+                payload = result
+                payload = result if raw else json.loads(result) if result else None
+                state = "success"
+                return payload
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                response_headers = dict(exc.headers.items()) if exc.headers else {}
+                try:
+                    message = exc.read(4096).decode(errors="replace")
+                finally:
+                    exc.close()
+                try:
+                    payload = json.loads(message)
+                except (ValueError, TypeError):
+                    payload = message
+                raise APIError(status, message.replace(self.token, "[REDACTED]")[:1200]) from None
+            except (urllib.error.URLError, TimeoutError):
+                state = "network_error"
+                raise
+        finally:
+            finished_at, elapsed_ms = time.time(), (time.monotonic() - started) * 1000
+            if self.observer is not None:
+                try:
+                    self.observer(copy.deepcopy({
+                        "method": req.get_method(), "path": urllib.parse.urlsplit(path).path,
+                        "started_at": started_at, "finished_at": finished_at,
+                        "elapsed_ms": elapsed_ms, "status_code": status,
+                        "state": state, "attempt": attempt,
+                        "request": {"headers": dict(req.header_items()),
+                                    "query": {**dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(path).query)), **(query or {})},
+                                    "body": body},
+                        "response": {"headers": response_headers, "body": payload},
+                        "_secrets": (self.token,),
+                    }))
+                except Exception:
+                    # Capture must never turn a successful mutation into a retry.
+                    pass
 
     def events(self, session_id, after_id=None):
         query = {"order": "asc", "limit": 100}
