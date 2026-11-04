@@ -138,7 +138,7 @@ qoder-self-hosted-sandboxes-demo chat
 qoder-self-hosted-sandboxes-demo chat --message "沿用当前 CSV，恢复全部分类，并解释计算过程。"
 ```
 
-也可在同一 Qoder Session 发送；观察页只跟踪这些消息的执行。终端 `/back` 返回收尾，等待上一轮结束再继续。发送结果不明确时，先核对会话，再输入 `/retry` 或执行 `chat --retry` 沿用原消息编号重试；`/discard` 只放弃本地重试记录，不撤回消息。自由对话不套用默认三轮数字验收，发布产物仍需核算；显式 `verify --phase append` 仍检查第三轮固定规则。
+也可在同一 Qoder Session 发送；观察页只跟踪这些消息的执行。终端输入 `/exit` 结束 chat 返回主菜单；提交或等待回复期间也有效，退出只结束本机对话界面，已提交任务继续执行并可在 Web 观察。再次发送消息前先确认上一轮结束。发送结果不明确时，先核对会话，再输入 `/retry` 或执行 `chat --retry` 沿用原消息编号重试；`/discard` 只放弃本地重试记录，不撤回消息。自由对话不套用默认三轮数字验收，发布产物仍需核算；显式 `verify --phase append` 仍检查第三轮固定规则。
 
 需要命令行从零连续执行三轮时，可用 `qoder-self-hosted-sandboxes-demo all --keep`；`--keep` 保留运行供核对，结束后仍需手动回收。已有未回收资源时，不重复 `setup`。
 

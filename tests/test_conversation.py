@@ -74,14 +74,14 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual(live.snapshot()['turns'][0]['source'],'terminal')
 
     def test_interactive_failure_stays_in_chat_and_retry_uses_same_request(self):
-        with patch('builtins.input',side_effect=['现场追问','/retry','/back']):
+        with patch('builtins.input',side_effect=['现场追问','/retry','/exit']):
             conversation.chat(self.config,{},self.state)
         self.assertEqual(len(self.api.feed),1)
         self.assertEqual(self.api.requests[0],self.api.requests[1])
         self.assertFalse(self.pending.exists())
 
     def test_explicit_discard_clears_record_without_resending(self):
-        with patch('builtins.input',side_effect=['现场追问','另一个请求','/discard','/back']):
+        with patch('builtins.input',side_effect=['现场追问','另一个请求','/discard','/exit']):
             conversation.chat(self.config,{},self.state)
         self.assertEqual(len(self.api.requests),1)
         self.assertFalse(self.pending.exists())
@@ -106,3 +106,21 @@ class ConversationTests(unittest.TestCase):
         with self.assertRaises(ChatError):
             conversation.chat(self.config,{},self.state,message='')
         self.assertEqual(self.api.requests,[])
+
+
+    def test_one_shot_exit_text_is_sent_as_message_not_local_command(self):
+        self.api.lose_response = False
+        conversation.chat(self.config,{},self.state,message='/exit')
+        self.assertEqual(self.api.feed[0]['content'][0]['text'],'/exit')
+        self.assertFalse(self.pending.exists())
+
+    def test_exit_during_submission_does_not_clear_the_saved_retry_record(self):
+        import threading
+        stopped = threading.Event()
+        class CompletingAfterExit:
+            def send(_self, text, key, source):
+                stopped.set()
+                return {'id':'message-after-exit'}
+        receipt = conversation.submit(CompletingAfterExit(),self.state,'pending text',stopped=stopped)
+        self.assertEqual(receipt['id'],'message-after-exit')
+        self.assertEqual(json.loads(self.pending.read_text())['text'],'pending text')

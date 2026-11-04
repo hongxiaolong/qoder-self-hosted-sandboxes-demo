@@ -9,6 +9,13 @@ const assets = path.join(
   __dirname,
   "../src/qoder_self_hosted_sandboxes_demo/demos/report_analyst/web",
 );
+async function waitFor(check) {
+  const deadline = Date.now() + 2500;
+  while (!check()) {
+    assert.ok(Date.now() < deadline, "expected UI state was not reached");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
 
 function fixture() {
   const stamp = Date.now() / 1000;
@@ -95,12 +102,112 @@ function fixture() {
         elapsed_ms: 123,
       }),
       event("message-two", "message", "m2", { output: "解释当前结果" }),
-      event("model-two", "model", "m2", { label: "模型开始" }),
+      event("model-two", "model", "m2", {
+        kind: "model_request_start",
+        label: "模型开始",
+      }),
     ],
   };
 }
 
-async function page(t, payload = fixture(), reduced = false) {
+// Supply the backend DTO in browser-only tests. Production numbering comes
+// from the persistent SQLite sequence, tested independently in test_interactions.
+function withInteractions(payload) {
+  if (payload.interactions) return payload;
+  const parents = new Map(),
+    names = new Map();
+  for (const tool of [
+    ...(payload.session?.tools || []),
+    ...(payload.execution?.events || []),
+  ]) {
+    if (tool.message_id) parents.set(tool.id, tool.message_id);
+    if (tool.tool) names.set(tool.id, tool.tool);
+  }
+  for (const event of payload.events)
+    if (event.tool_id && event.message_id)
+      parents.set(event.tool_id, event.message_id);
+  const conversations = (payload.session?.turns || []).map((turn, i) => {
+    turn.number ||= i + 1;
+    const steps = [];
+    const add = (event, key, source, target, flow) => {
+      let step = steps.find((item) => item.id === key);
+      if (!step) {
+        step = {
+          id: key,
+          kind: "interaction",
+          source_kind: event.kind,
+          tool_id: event.tool_id,
+          source,
+          target,
+          flow,
+          label: source + " → " + target,
+          number: steps.length + 1,
+          event_ids: [],
+        };
+        steps.push(step);
+      }
+      step.event_ids.push(event.id);
+    };
+    for (const event of payload.events) {
+      if ((event.message_id || parents.get(event.tool_id)) !== turn.id)
+        continue;
+      const tool = event.tool_id;
+      if (event.kind === "user.message")
+        add(event, event.id, "input", "session", "input");
+      else if (event.kind === "agent.message" && event.output?.trim())
+        add(event, event.id, "loop", "session", "reply");
+      else if (["agent.tool_use", "agent.custom_tool_use"].includes(event.kind))
+        add(event, "request:" + tool, "loop", "events", "loop-events");
+      else if (["tool_started", "tool_received"].includes(event.kind)) {
+        add(event, "receive:" + tool, "events", "worker", "request");
+        if (event.kind === "tool_started" && names.get(tool) === "run_python")
+          add(event, "python-call:" + tool, "worker", "python", "python");
+      } else if (
+        event.kind === "tool_execution" &&
+        names.get(tool) === "run_python" &&
+        event.state !== "running"
+      )
+        add(
+          event,
+          "python-return:" + tool,
+          "python",
+          "worker",
+          "python-result",
+        );
+      else if (
+        [
+          "user.tool_result",
+          "user.custom_tool_result",
+          "agent.tool_result",
+        ].includes(event.kind)
+      )
+        add(event, "result:" + tool, "worker", "events", "result");
+      else if (event.kind === "tool_stage" && event.stage === "csv_transfer")
+        add(event, event.id, "browser", "worker", "csv");
+      else if (
+        ["session.status_running", "session.status_busy"].includes(event.kind)
+      )
+        add(event, "activate", "session", "loop", "model");
+    }
+    return {
+      message_id: turn.id,
+      number: turn.number,
+      total_steps: steps.length,
+      partial: false,
+      steps,
+    };
+  });
+  payload.interactions = { version: 4, conversations };
+  return payload;
+}
+
+async function page(
+  t,
+  payload = fixture(),
+  reduced = false,
+  view = "operations",
+  followExisting = true,
+) {
   const dom = new JSDOM(
     fs.readFileSync(path.join(assets, "portal.html"), "utf8"),
     {
@@ -136,7 +243,7 @@ async function page(t, payload = fixture(), reduced = false) {
         output: "历史完整回复",
       });
     }
-    return { ok: true, json: async () => result };
+    return { ok: true, json: async () => withInteractions(result) };
   };
   w.matchMedia = (query) => ({
     matches: reduced && query.includes("reduced-motion"),
@@ -159,6 +266,15 @@ async function page(t, payload = fixture(), reduced = false) {
   });
   w.eval(fs.readFileSync(path.join(assets, "live.js"), "utf8"));
   await new Promise(setImmediate);
+  if (view) {
+    w.document.getElementById("trace-view").value = view;
+    w.document
+      .getElementById("trace-view")
+      .dispatchEvent(new w.Event("change"));
+  }
+  // Most fixtures represent an already-running Session. Explicitly join it;
+  // first-load behavior is checked separately without this user action.
+  if (followExisting) w.document.getElementById("follow-latest").click();
   assert.deepEqual(errors, [], "initial DOM render must not throw");
   return {
     w,
@@ -246,7 +362,7 @@ test("search and filters update detail immediately and clear hidden selections",
   const { d, w } = await page(t);
   d.querySelector('[data-filter="tool"]').click();
   d.querySelector('[data-tab="io"]').click();
-  assert.ok(d.getElementById("python-node").classList.contains("selected"));
+  assert.ok(d.getElementById("worker-node").classList.contains("selected"));
   assert.match(d.getElementById("event-detail").textContent, /print\(42\)/);
   const search = d.getElementById("event-search");
   search.value = "no-match";
@@ -336,20 +452,20 @@ test("message replay fetches full history without sends and supports stepping ba
     [...d.querySelectorAll(".replay-controls button")].find(
       (b) => b.textContent === text,
     );
-  step("下一事件").click();
-  assert.equal(d.querySelector("#python-node .trace-step").textContent, "2");
+  step("下一步").click();
+  assert.equal(d.querySelector("#worker-node .trace-step").textContent, "2");
   assert.equal(d.querySelectorAll(".trace-step").length, 1);
   assert.equal(
     d.querySelector("#event-rows .selected").dataset.event,
     "execution:tool-a",
   );
-  step("下一事件").click();
+  step("下一步").click();
   d.querySelector('[data-tab="io"]').click();
   assert.match(d.getElementById("event-detail").textContent, /历史完整回复/);
   assert.ok(requests.some((r) => r.url === "/api/observer?message_id=m1"));
   assert.ok(requests.every((r) => !r.options.method));
   step("返回实时").click();
-  assert.equal(d.querySelector(".trace-step"), null);
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
   assert.equal(d.getElementById("connection-status").textContent, "实时连接");
   assert.equal(d.getElementById("trace-scope").value, "session");
   assert.deepEqual(errors, []);
@@ -372,7 +488,7 @@ test("returning live while history loads ignores the late history response", asy
     }),
   });
   await new Promise(setImmediate);
-  assert.equal(d.querySelector(".trace-step"), null);
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
   assert.equal(d.getElementById("connection-status").textContent, "实时连接");
   assert.equal(d.querySelector('[data-event="late-replay"]'), null);
 });
@@ -381,35 +497,37 @@ test("replay keeps exact-tool stages even when Worker did not record a message I
   const { d, w } = await page(t);
   w.fetch = async () => ({
     ok: true,
-    json: async () => ({
-      message_id: "m1",
-      execution: { events: [] },
-      events: [
-        {
-          id: "message",
-          kind: "user.message",
-          category: "message",
-          message_id: "m1",
-          label: "用户消息",
-        },
-        {
-          id: "stage",
-          kind: "tool_stage",
-          category: "tool",
-          tool_id: "tool-a",
-          message_id: null,
-          label: "CSV传输",
-          role: "transfer",
-        },
-        {
-          id: "reply",
-          kind: "agent.message",
-          category: "message",
-          message_id: "m1",
-          label: "Agent回复",
-        },
-      ],
-    }),
+    json: async () =>
+      withInteractions({
+        message_id: "m1",
+        session: { turns: [{ id: "m1", number: 1 }] },
+        execution: { events: [] },
+        events: [
+          {
+            id: "message",
+            kind: "user.message",
+            category: "message",
+            message_id: "m1",
+            label: "用户消息",
+          },
+          {
+            id: "stage",
+            kind: "tool_stage",
+            category: "tool",
+            tool_id: "tool-a",
+            message_id: null,
+            label: "CSV传输",
+            role: "transfer",
+          },
+          {
+            id: "reply",
+            kind: "agent.message",
+            category: "message",
+            message_id: "m1",
+            label: "Agent回复",
+          },
+        ],
+      }),
   });
   d.querySelector('[data-turn="m1"] .replay-button').click();
   await new Promise(setImmediate);
@@ -452,7 +570,7 @@ test("replay badges follow events, not manually inspected resources", async (t) 
   assert.ok(d.querySelector("#environment-node.selected"));
   assert.equal(d.querySelector(".trace-step"), null);
   d.querySelector('[data-event="execution:tool-a"]').click();
-  assert.equal(d.querySelector("#python-node .trace-step").textContent, "2");
+  assert.equal(d.querySelector("#worker-node .trace-step").textContent, "2");
   assert.equal(d.querySelector("#environment-node.selected"), null);
 });
 
@@ -480,7 +598,7 @@ test("replay keeps its selected frame and order while filters hide the current e
   d.querySelector('[data-filter="tool"]').click();
   const next = () =>
     [...d.querySelectorAll(".replay-controls button")].find(
-      (b) => b.textContent === "下一事件",
+      (b) => b.textContent === "下一步",
     );
   next().click();
   next().click();
@@ -506,7 +624,7 @@ test("keyboard replay controls retain focus after rebuilding and at a boundary",
   await new Promise(setImmediate);
   const next = () =>
     [...d.querySelectorAll(".replay-controls button")].find(
-      (b) => b.textContent === "下一事件",
+      (b) => b.textContent === "下一步",
     );
   next().focus();
   next().click();
@@ -725,6 +843,7 @@ function traceFixture() {
     {
       id: "stage-a",
       kind: "tool_stage",
+      stage: "csv_transfer",
       category: "tool",
       label: "CSV传输",
       message_id: "m1",
@@ -792,7 +911,7 @@ function traceFixture() {
       },
       {
         id: "turn:m1",
-        label: "本轮输入",
+        label: "对话",
         scope: "turn",
         message_id: "m1",
         rows: [
@@ -815,7 +934,7 @@ function traceFixture() {
       },
       {
         id: "turn:m2",
-        label: "本轮输入",
+        label: "对话",
         scope: "turn",
         message_id: "m2",
         rows: [
@@ -852,11 +971,15 @@ function traceFixture() {
       },
     ],
   };
+  payload.events.find((e) => e.id === "message-one").time = stamp - 30;
+  payload.events.find((e) => e.id === "execution:tool-a").time = stamp - 5;
+  payload.events.sort((a, b) => (a.time || 0) - (b.time || 0));
   return payload;
 }
 
 test("operation tree merges phases, exposes stages and keeps a raw event view", async (t) => {
   const { d } = await page(t, traceFixture());
+  d.querySelector('[data-turn="m1"]').click();
   assert.equal(d.querySelectorAll('[data-operation="tool:tool-a"]').length, 1);
   assert.equal(d.querySelector('[data-operation="event:stage-a"]'), null);
   d.querySelector('[aria-label="展开run_python的阶段"]').click();
@@ -979,11 +1102,11 @@ test("replay conceals future operation outcome, duration and waterfall", async (
   assert.doesNotMatch(row.textContent, /已回传|3\.0s|失败/);
   assert.equal(row.querySelector(".trace-bar"), null);
   [...d.querySelectorAll(".replay-controls button")]
-    .find((b) => b.textContent === "下一事件")
+    .find((b) => b.textContent === "下一步")
     .click();
   assert.match(
     d.querySelector('[data-operation="tool:tool-a"]').textContent,
-    /已回传|完成|已记录/,
+    /执行中/,
   );
 });
 
@@ -1002,10 +1125,947 @@ test("raw replay conceals future outcome and duration until its event", async (t
   assert.doesNotMatch(future.textContent, /123ms/);
   assert.ok(!future.querySelector(".event-state.error"));
   [...d.querySelectorAll(".replay-controls button")]
-    .find((b) => b.textContent === "下一事件")
+    .find((b) => b.textContent === "下一步")
     .click();
+  for (
+    let i = 0;
+    i < 5 &&
+    d
+      .querySelector('[data-event="execution:tool-a"]')
+      .classList.contains("future");
+    i++
+  )
+    [...d.querySelectorAll(".replay-controls button")]
+      .find((b) => b.textContent === "下一步")
+      .click();
   const current = d.querySelector('[data-event="execution:tool-a"]');
   assert.ok(!current.classList.contains("future"));
   assert.match(current.textContent, /123ms/);
   assert.ok(current.querySelector(".event-state.error"));
+});
+
+test("live input steps advance, remain scoped and ignore background heartbeats", async (t) => {
+  const payload = fixture();
+  const { d, refresh, errors } = await page(t, payload);
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+  assert.match(
+    d.querySelector('[data-turn="m2"] .live-progress').textContent,
+    /交互 1 · 已发生 1/,
+  );
+  const next = structuredClone(payload);
+  next.session.tools.push({ id: "live-tool", message_id: "m2" });
+  next.execution.events.push({
+    id: "live-tool",
+    tool: "run_python",
+    message_id: "m2",
+    state: "running",
+  });
+  next.events.push({
+    id: "live-start",
+    kind: "tool_started",
+    category: "tool",
+    role: "analysis",
+    tool_id: "live-tool",
+    state: "running",
+    label: "开始分析",
+  });
+  next.events.push({
+    id: "heartbeat",
+    kind: "heartbeat_confirmed",
+    category: "heartbeat",
+    role: "worker",
+    state: "observed",
+    label: "心跳",
+  });
+  await refresh(next);
+  await waitFor(
+    () => d.querySelector("#python-node .trace-step")?.textContent === "3",
+  );
+  assert.equal(d.querySelector("#python-node .trace-step").textContent, "3");
+  assert.match(
+    d.querySelector('[data-turn="m2"] .live-progress').textContent,
+    /交互 3 · 已发生 3/,
+  );
+  assert.equal(d.querySelectorAll(".trace-step").length, 1);
+  d.querySelector('[data-event="heartbeat"]').click();
+  assert.equal(d.querySelector(".trace-step"), null);
+  d.querySelector('[data-event="message-one"]').click();
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+  assert.match(
+    d.querySelector('[data-turn="m1"] .live-progress').textContent,
+    /交互 1 · 已发生 2/,
+  );
+  assert.equal(d.querySelector('[data-turn="m2"] .live-progress'), null);
+  d.querySelector("#environment-node > .group-heading .node-title").click();
+  assert.equal(d.querySelector(".trace-step"), null);
+  assert.deepEqual(errors, []);
+});
+
+test("stable server step numbers survive filtering and partial windows", async (t) => {
+  const payload = withInteractions(traceFixture());
+  const entry = payload.interactions.conversations.find(
+    (c) => c.message_id === "m1",
+  );
+  entry.number = 12;
+  entry.total_steps = 8;
+  entry.partial = true;
+  entry.steps.at(-1).number = 8;
+  payload.session.turns[0].number = 12;
+  const { d } = await page(t, payload);
+  d.querySelector('[data-filter="tool"]').click();
+  assert.equal(d.querySelector(".trace-step").textContent, "8");
+  assert.match(
+    d.querySelector('[data-turn="m1"] .live-progress').textContent,
+    /部分记录.*8.*已发生 8 次交互/,
+  );
+  assert.match(d.querySelector('[data-turn="m1"] time').textContent, /对话 12/);
+  assert.ok(
+    [...d.querySelectorAll(".group-toggle")].some((e) =>
+      /对话 12/.test(e.textContent),
+    ),
+  );
+  d.querySelector('[data-filter="model"]').click();
+  assert.equal(
+    d.querySelector(".trace-step"),
+    null,
+    "internal model records never get a handoff ordinal",
+  );
+  assert.match(d.querySelector("#event-rows").textContent, /组件内部/);
+});
+
+test("live operation view follows a tool stage instead of an older parent phase", async (t) => {
+  const payload = traceFixture();
+  payload.session.turns = [payload.session.turns[0]];
+  payload.events.push({
+    id: "stage-live",
+    kind: "tool_stage",
+    stage: "csv_transfer",
+    category: "tool",
+    role: "transfer",
+    tool_id: "tool-a",
+    state: "observed",
+    label: "继续传输",
+  });
+  payload.tracing.groups[1].rows.push({
+    id: "event:stage-live",
+    type: "event",
+    operation: "stage",
+    parent_id: "tool:tool-a",
+    role: "transfer",
+    label: "继续传输",
+    state: "observed",
+    event_ids: ["stage-live"],
+    tool_id: "tool-a",
+  });
+  const { d } = await page(t, payload);
+  assert.equal(
+    d.querySelector("#event-rows .selected").dataset.event,
+    "stage-live",
+  );
+  assert.equal(d.querySelector("#worker-node .trace-step").textContent, "7");
+  assert.match(
+    d.querySelector('[data-turn="m1"] .live-progress').textContent,
+    /7 · 已发生 7/,
+  );
+});
+
+test("component handoffs share endpoints and ordinals in live, replay and manual inspection", async (t) => {
+  const payload = traceFixture();
+  // Deliberately different phase timestamps; flow catalog controls replay order.
+  const phaseIds = [
+    "message-one",
+    "start-a",
+    "stage-a",
+    "execution:tool-a",
+    "result-a",
+  ];
+  payload.events.sort((a, b) => {
+    const ai = phaseIds.indexOf(a.id),
+      bi = phaseIds.indexOf(b.id);
+    return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+  });
+  payload.events.push({
+    id: "visible-reply",
+    kind: "agent.message",
+    category: "message",
+    message_id: "m1",
+    role: "qoder",
+    label: "Agent回复",
+    output: "完成分析",
+  });
+  for (let i = 0; i < 100; i++)
+    payload.events.push({
+      id: "noise-" + i,
+      kind: i % 2 ? "heartbeat_confirmed" : "http.request",
+      category: i % 2 ? "heartbeat" : "http",
+      message_id: "m1",
+      tool_id: "tool-a",
+      role: "worker",
+      label: "后台记录",
+    });
+  const data = withInteractions(payload);
+  const entry = data.interactions.conversations.find(
+    (c) => c.message_id === "m1",
+  );
+  assert.equal(entry.total_steps, 7);
+  const { d, w } = await page(t, data);
+  d.getElementById("trace-view").value = "events";
+  d.getElementById("trace-view").dispatchEvent(
+    new d.defaultView.Event("change"),
+  );
+  // A source fact can prove delivery and Python invocation; manual selection
+  // uses its most specific handoff. Replay visits both explicit boundaries.
+  const checked = new Set();
+  for (const step of [...entry.steps].reverse()) {
+    const id = step.event_ids[0];
+    if (checked.has(id)) continue;
+    checked.add(id);
+    d.querySelector('[data-event="' + id + '"]').click();
+    assert.equal(d.querySelectorAll(".trace-step").length, 1);
+    assert.equal(
+      d.querySelector(".trace-step").textContent,
+      String(step.number),
+    );
+    assert.equal(
+      d.querySelector(".trace-step").parentElement.id,
+      step.target + "-node",
+    );
+  }
+  d.querySelector('[data-event="noise-1"]').click();
+  assert.equal(d.querySelector(".trace-step"), null);
+  assert.match(d.querySelector('[data-event="noise-1"]').textContent, /后台/);
+  const history = structuredClone(data);
+  history.message_id = "m1";
+  history.events = history.events.filter(
+    (e) => e.message_id === "m1" || e.tool_id === "tool-a",
+  );
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => structuredClone(history),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  const control = (name) =>
+    [...d.querySelectorAll(".replay-controls button")].find(
+      (b) => b.textContent === name,
+    );
+  for (const [i, step] of entry.steps.entries()) {
+    if (i) control("下一步").click();
+    assert.equal(
+      d.querySelector(".trace-step").textContent,
+      String(step.number),
+    );
+    assert.equal(
+      d.querySelector(".trace-step").parentElement.id,
+      step.target + "-node",
+    );
+    assert.match(
+      d.querySelector(".replay-controls").textContent,
+      new RegExp("交互 " + step.number + " / 7"),
+    );
+    assert.ok(d.querySelector('[data-flow="' + step.flow + '"].selected'));
+  }
+});
+
+test("missing task flow history never falls back to numbering raw logs", async (t) => {
+  const { d, w } = await page(t);
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => ({ message_id: "m1", events: fixture().events }),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  assert.match(
+    d.querySelector('[data-turn="m1"] [role="alert"]').textContent,
+    /重启本机 preview/,
+  );
+  assert.notEqual(
+    d.getElementById("connection-status").textContent,
+    "历史回放",
+  );
+});
+
+test("replay output visibility follows phases even when cloud and worker clocks disagree", async (t) => {
+  const payload = traceFixture();
+  payload.events.unshift({
+    id: "request-skew",
+    kind: "agent.custom_tool_use",
+    category: "tool",
+    message_id: "m1",
+    tool_id: "tool-a",
+    label: "工具请求",
+    role: "qoder",
+    state: "observed",
+    time: payload.observed_at + 10,
+  });
+  const data = withInteractions(payload);
+  const entry = data.interactions.conversations.find(
+    (c) => c.message_id === "m1",
+  );
+  const ordered = [
+    "message-one",
+    "request-skew",
+    "start-a",
+    "stage-a",
+    "execution:tool-a",
+    "result-a",
+  ];
+  entry.steps.sort(
+    (a, b) => ordered.indexOf(a.event_ids[0]) - ordered.indexOf(b.event_ids[0]),
+  );
+  entry.steps.forEach((step, index) => (step.number = index + 1));
+  const { d, w } = await page(t, data);
+  const history = structuredClone(data);
+  history.message_id = "m1";
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => structuredClone(history),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  [...d.querySelectorAll(".replay-controls button")]
+    .find((b) => b.textContent === "下一步")
+    .click();
+  d.querySelector('[data-tab="io"]').click();
+  assert.doesNotMatch(
+    d.getElementById("event-detail").textContent,
+    /输出 · 已保存字段/,
+  );
+  d.querySelector('[data-tab="raw"]').click();
+  assert.doesNotMatch(
+    d.getElementById("event-detail").textContent,
+    /"output"\s*:\s*"42"/,
+  );
+  d.getElementById("trace-view").value = "events";
+  d.getElementById("trace-view").dispatchEvent(
+    new d.defaultView.Event("change"),
+  );
+  d.querySelector('[data-event="execution:tool-a"]').click();
+  d.querySelector('[data-tab="io"]').click();
+  assert.match(
+    d.getElementById("event-detail").textContent,
+    /输出 · 已保存字段/,
+  );
+  assert.equal(d.querySelector(".trace-step").textContent, "6");
+});
+
+test("mirrored result records keep one frame and one number across manual selection", async (t) => {
+  const payload = fixture();
+  const input = payload.events[0];
+  const result = {
+    id: "result-mirror",
+    kind: "user.custom_tool_result",
+    category: "tool",
+    message_id: "m1",
+    tool_id: "tool-a",
+    label: "QCA 接收结果",
+    role: "qoder",
+  };
+  const alias = { ...result, id: "result-official" };
+  payload.events = [input, result, alias];
+  payload.interactions = {
+    version: 4,
+    conversations: [
+      {
+        message_id: "m1",
+        number: 1,
+        total_steps: 2,
+        partial: false,
+        steps: [
+          {
+            id: "input",
+            number: 1,
+            source: "input",
+            target: "session",
+            flow: "input",
+            event_ids: [input.id],
+          },
+          {
+            id: "result",
+            number: 2,
+            source: "worker",
+            target: "events",
+            flow: "result",
+            event_ids: [result.id, alias.id],
+          },
+        ],
+      },
+    ],
+  };
+  const { d, w } = await page(t, payload);
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => ({ ...structuredClone(payload), message_id: "m1" }),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  const next = () =>
+    [...d.querySelectorAll(".replay-controls button")].find(
+      (b) => b.textContent === "下一步",
+    );
+  next().click();
+  assert.equal(d.querySelectorAll(".trace-step").length, 1);
+  assert.equal(d.querySelector(".trace-step").textContent, "2");
+  assert.equal(
+    next().disabled,
+    true,
+    "result aliases must not repeat a playback step",
+  );
+  d.querySelector('[data-event="result-official"]').click();
+  assert.equal(d.querySelector(".trace-step").textContent, "2");
+  assert.equal(d.querySelector(".trace-step").parentElement.id, "events-node");
+  assert.match(d.querySelector(".replay-controls").textContent, /交互 2 \/ 2/);
+  assert.equal(next().disabled, true);
+});
+
+test("default component view exposes each handoff separately even when evidence is shared", async (t) => {
+  const payload = withInteractions(traceFixture());
+  const { d } = await page(t, payload, false, null);
+  assert.equal(d.getElementById("trace-view").value, "interactions");
+  const entry = payload.interactions.conversations.find(
+    (c) => c.message_id === "m1",
+  );
+  const receipt = entry.steps.find((step) => step.flow === "request");
+  const invocation = entry.steps.find((step) => step.flow === "python");
+  assert.equal(receipt.event_ids[0], invocation.event_ids[0]);
+  for (const step of [receipt, invocation]) {
+    d.querySelector('[data-interaction="' + step.id + '"]').click();
+    assert.equal(d.querySelectorAll(".trace-step").length, 1);
+    assert.equal(
+      d.querySelector(".trace-step").textContent,
+      String(step.number),
+    );
+    assert.equal(
+      d.querySelector(".trace-step").parentElement.id,
+      step.target + "-node",
+    );
+    assert.ok(d.querySelector('[data-flow="' + step.flow + '"].selected'));
+    assert.equal(
+      d.getElementById("event-detail").querySelector("h3").textContent,
+      step.label,
+    );
+    assert.equal(d.querySelectorAll("#event-rows .selected").length, 1);
+    assert.equal(
+      d.querySelector("#event-rows .selected").dataset.interaction,
+      step.id,
+    );
+  }
+  assert.doesNotMatch(
+    d.getElementById("event-rows").textContent,
+    /模型开始|租约失败/,
+  );
+});
+
+test("incremental live execution and replay use identical component ordinals, endpoints and paths", async (t) => {
+  let payload = fixture();
+  payload.session.turns = [payload.session.turns[0]];
+  payload.session.active_message_id = "m1";
+  payload.session.tools = [
+    { id: "tool-a", message_id: "m1", tool: "run_python" },
+  ];
+  payload.execution.events = [
+    { id: "tool-a", message_id: "m1", tool: "run_python", state: "running" },
+  ];
+  payload.events = [payload.events[0]];
+  const { d, w, refresh } = await page(t, payload, false, null);
+  const seen = [{ number: "1", target: "session-node", flow: "input" }];
+  const facts = [
+    ["agent.custom_tool_use", "qoder", "tool", "events-node", "loop-events"],
+    ["tool_received", "worker", "tool", "worker-node", "request"],
+    ["tool_started", "analysis", "tool", "python-node", "python"],
+    ["tool_execution", "analysis", "tool", "worker-node", "python-result"],
+    ["user.custom_tool_result", "qoder", "tool", "events-node", "result"],
+    ["agent.message", "qoder", "message", "session-node", "reply"],
+  ];
+  for (const [index, [kind, role, category, target, flow]] of facts.entries()) {
+    payload = structuredClone(payload);
+    payload.events.push({
+      id: "cross-" + index,
+      message_id: "m1",
+      tool_id: category === "tool" ? "tool-a" : undefined,
+      kind,
+      role,
+      category,
+      state: kind === "tool_execution" ? "completed" : "observed",
+      label: kind,
+      output: kind === "agent.message" ? "完成" : "",
+      time: payload.observed_at + index,
+    });
+    payload.events.push({
+      id: "internal-" + index,
+      message_id: "m1",
+      kind: "model_request_start",
+      category: "model",
+      role: "qoder",
+      label: "模型内部",
+    });
+    payload.events.push({
+      id: "heartbeat-" + index,
+      kind: "heartbeat_confirmed",
+      category: "heartbeat",
+      role: "worker",
+      label: "心跳",
+    });
+    await refresh(payload);
+    await waitFor(
+      () => d.querySelector(".trace-step")?.textContent === String(index + 2),
+    );
+    const badge = d.querySelector(".trace-step");
+    assert.equal(d.querySelectorAll(".trace-step").length, 1);
+    assert.equal(badge.textContent, String(index + 2));
+    assert.equal(badge.parentElement.id, target);
+    assert.ok(d.querySelector('[data-flow="' + flow + '"].selected'));
+    seen.push({ number: badge.textContent, target, flow });
+  }
+  const history = withInteractions(structuredClone(payload));
+  history.message_id = "m1";
+  assert.equal(history.interactions.conversations[0].total_steps, 7);
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => structuredClone(history),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  for (const [i, expected] of seen.entries()) {
+    if (i)
+      [...d.querySelectorAll(".replay-controls button")]
+        .find((b) => b.textContent === "下一步")
+        .click();
+    assert.equal(d.querySelector(".trace-step").textContent, expected.number);
+    assert.equal(
+      d.querySelector(".trace-step").parentElement.id,
+      expected.target,
+    );
+    assert.ok(d.querySelector('[data-flow="' + expected.flow + '"].selected'));
+    const step = history.interactions.conversations[0].steps[i];
+    d.querySelector('[data-interaction="' + step.id + '"]').click();
+    assert.equal(d.querySelector(".trace-step").textContent, expected.number);
+    assert.equal(
+      d.querySelector("#event-rows .selected").dataset.interaction,
+      step.id,
+    );
+  }
+});
+
+test("local Worker completion remains internal and cannot expose its output before result handoff", async (t) => {
+  const payload = traceFixture();
+  payload.execution.events[0].tool = "Read";
+  payload.events = payload.events.filter((event) => event.id !== "stage-a");
+  const history = withInteractions(payload);
+  history.message_id = "m1";
+  const { d, w } = await page(t, payload, false, null);
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => structuredClone(history),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  const next = () =>
+    [...d.querySelectorAll(".replay-controls button")].find(
+      (b) => b.textContent === "下一步",
+    );
+  next().click();
+  assert.equal(d.querySelector(".trace-step").parentElement.id, "worker-node");
+  assert.doesNotMatch(
+    d.getElementById("event-detail").textContent,
+    /输出 · 已保存字段/,
+  );
+  next().click();
+  assert.equal(d.querySelector(".trace-step").parentElement.id, "events-node");
+  assert.match(
+    d.getElementById("event-detail").textContent,
+    /输出 · 已保存字段/,
+  );
+});
+
+test("legacy completion evidence never exposes the result at the inferred Python submission", async (t) => {
+  const payload = fixture();
+  payload.events = payload.events.filter((event) => event.message_id === "m1");
+  payload.events[1].state = "completed";
+  payload.interactions = {
+    version: 4,
+    conversations: [
+      {
+        message_id: "m1",
+        number: 1,
+        total_steps: 3,
+        partial: false,
+        steps: [
+          {
+            id: "input",
+            number: 1,
+            source: "input",
+            target: "session",
+            flow: "input",
+            label: "会话输入 → Session",
+            event_ids: ["message-one"],
+          },
+          {
+            id: "call",
+            number: 2,
+            source: "worker",
+            target: "python",
+            flow: "python",
+            tool_id: "tool-a",
+            label: "Worker → Python · 提交代码",
+            event_ids: ["execution:tool-a"],
+          },
+          {
+            id: "return",
+            number: 3,
+            source: "python",
+            target: "worker",
+            flow: "python-result",
+            tool_id: "tool-a",
+            label: "Python → Worker · 返回结果",
+            event_ids: ["execution:tool-a"],
+          },
+        ],
+      },
+    ],
+  };
+  const { d, w } = await page(t, payload, false, null);
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => ({ ...structuredClone(payload), message_id: "m1" }),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  const next = () =>
+    [...d.querySelectorAll(".replay-controls button")].find(
+      (b) => b.textContent === "下一步",
+    );
+  next().click();
+  assert.equal(d.querySelector(".trace-step").parentElement.id, "python-node");
+  assert.doesNotMatch(
+    d.getElementById("event-detail").textContent,
+    /输出 · 已保存字段/,
+  );
+  d.querySelector('[data-tab="raw"]').click();
+  assert.doesNotMatch(
+    d.getElementById("event-detail").textContent,
+    /"output"\s*:\s*"42"/,
+  );
+  next().click();
+  d.querySelector('[data-tab="io"]').click();
+  assert.equal(d.querySelector(".trace-step").parentElement.id, "worker-node");
+  assert.match(
+    d.getElementById("event-detail").textContent,
+    /输出 · 已保存字段/,
+  );
+});
+
+test("Browser control and CSV return connect to the Worker leaf rather than the Analysis container", async (t) => {
+  const payload = fixture();
+  const { d, w, refresh } = await page(t, payload, false, null);
+  const boxes = {
+    architecture: [0, 0, 1200, 700],
+    "analysis-node": [750, 180, 300, 220],
+    "worker-node": [780, 200, 90, 80],
+    "python-node": [900, 200, 90, 80],
+    "browser-node": [750, 500, 200, 120],
+  };
+  w.HTMLElement.prototype.getBoundingClientRect = function () {
+    const [left, top, width, height] = boxes[this.id] || [10, 10, 100, 50];
+    return {
+      left,
+      top,
+      right: left + width,
+      bottom: top + height,
+      width,
+      height,
+    };
+  };
+  await refresh(payload);
+  const cdp = d.querySelector('[data-flow="cdp"]').getAttribute("d");
+  const csv = d.querySelector('[data-flow="csv"]').getAttribute("d");
+  assert.match(cdp, /^M805\.2,280 /);
+  assert.match(csv, /H847\.5 V280$/);
+  assert.doesNotMatch(csv, /V400$/);
+});
+
+test("real-order startup and a two-tool model batch highlight Agent Loop and publish only once", async (t) => {
+  const payload = fixture();
+  payload.session.turns = [payload.session.turns[0]];
+  payload.session.active_message_id = "m1";
+  payload.execution.events = [
+    { id: "tool-a", tool: "Read", message_id: "m1" },
+    { id: "tool-b", tool: "runtime_evidence", message_id: "m1" },
+  ];
+  payload.events = [
+    payload.events[0],
+    {
+      id: "first-model",
+      kind: "span.model_request_start",
+      category: "model",
+      role: "qoder",
+      message_id: "m1",
+      label: "模型开始",
+    },
+    {
+      id: "remark",
+      kind: "agent.message",
+      category: "message",
+      role: "qoder",
+      message_id: "m1",
+      label: "Agent 回复",
+      output: "先检查技能和环境",
+    },
+    {
+      id: "request-a",
+      kind: "agent.tool_use",
+      category: "tool",
+      role: "qoder",
+      message_id: "m1",
+      tool_id: "tool-a",
+      label: "Read",
+      input: "skill-input",
+    },
+    {
+      id: "request-b",
+      kind: "agent.custom_tool_use",
+      category: "tool",
+      role: "qoder",
+      message_id: "m1",
+      tool_id: "tool-b",
+      label: "runtime_evidence",
+      input: "runtime-input",
+    },
+  ];
+  payload.interactions = {
+    version: 4,
+    conversations: [
+      {
+        message_id: "m1",
+        number: 1,
+        total_steps: 4,
+        partial: false,
+        steps: [
+          {
+            id: "input",
+            number: 1,
+            source: "input",
+            target: "session",
+            flow: "input",
+            label: "会话输入 → Session",
+            event_ids: ["message-one"],
+          },
+          {
+            id: "activate",
+            number: 2,
+            source: "session",
+            target: "loop",
+            flow: "model",
+            label: "Session → Agent Loop",
+            event_ids: ["first-model"],
+          },
+          {
+            id: "remark",
+            number: 3,
+            source: "loop",
+            target: "session",
+            flow: "reply",
+            label: "Agent Loop → Session",
+            event_ids: ["remark"],
+          },
+          {
+            id: "batch",
+            number: 4,
+            source: "loop",
+            target: "events",
+            flow: "loop-events",
+            label: "Agent Loop → Events API",
+            tool_ids: ["tool-a", "tool-b"],
+            event_ids: ["request-a", "request-b"],
+          },
+        ],
+      },
+    ],
+  };
+  const { d, w } = await page(t, payload, false, null);
+  d.querySelector('[data-interaction="activate"]').click();
+  assert.equal(d.querySelector(".trace-step").textContent, "2");
+  assert.equal(d.querySelector(".trace-step").parentElement.id, "loop-node");
+  assert.ok(d.querySelector("#session-node.sending"));
+  d.querySelector('[data-interaction="batch"]').click();
+  assert.equal(d.querySelector(".trace-step").textContent, "4");
+  assert.match(d.getElementById("event-detail").textContent, /2 项工具任务/);
+  [...d.querySelectorAll(".batch-tasks button")]
+    .find((b) => b.textContent === "runtime_evidence")
+    .click();
+  assert.equal(d.querySelector(".trace-step").textContent, "4");
+  assert.match(d.getElementById("event-detail").textContent, /runtime-input/);
+  w.fetch = async () => ({
+    ok: true,
+    json: async () => ({ ...structuredClone(payload), message_id: "m1" }),
+  });
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  await new Promise(setImmediate);
+  const expected = ["session-node", "loop-node", "session-node", "events-node"];
+  for (let i = 0; i < expected.length; i++) {
+    if (i)
+      [...d.querySelectorAll(".replay-controls button")]
+        .find((b) => b.textContent === "下一步")
+        .click();
+    assert.equal(d.querySelector(".trace-step").textContent, String(i + 1));
+    assert.equal(d.querySelector(".trace-step").parentElement.id, expected[i]);
+    assert.equal(d.querySelectorAll(".sending").length, 1);
+    assert.equal(
+      d.querySelector(".sending").id,
+      ["input-node", "session-node", "loop-node", "loop-node"][i],
+    );
+  }
+});
+
+function incomingTurn(payload, id, running = false) {
+  const next = structuredClone(payload);
+  delete next.interactions;
+  next.session.turns.push({
+    id,
+    text: id,
+    state: "running",
+    time: next.observed_at,
+  });
+  next.session.active_message_id = id;
+  next.events.push({
+    id: "input-" + id,
+    kind: "user.message",
+    category: "message",
+    message_id: id,
+    role: "qoder",
+    label: id,
+    output: id,
+  });
+  if (running)
+    next.events.push({
+      id: "running-" + id,
+      kind: "session.status_running",
+      category: "session",
+      message_id: id,
+      role: "qoder",
+      label: "开始处理",
+    });
+  return next;
+}
+
+test("initial page focuses Session without replaying existing history or pinning new input", async (t) => {
+  const payload = fixture();
+  const { d, refresh } = await page(t, payload, false, null, false);
+  assert.ok(d.querySelector("#session-node.selected"));
+  assert.equal(d.querySelector(".trace-step"), null);
+  assert.equal(
+    d.getElementById("follow-latest").getAttribute("aria-pressed"),
+    "true",
+  );
+  await refresh(incomingTurn(payload, "m3"));
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m3");
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+});
+
+test("live poll batches show every handoff and redraw preserves the active particle", async (t) => {
+  const payload = fixture();
+  payload.worker.state = "unknown"; // Cloud interaction does not require a healthy Worker.
+  const { d, refresh } = await page(t, payload, false, null, false);
+  const next = incomingTurn(payload, "m3", true);
+  await refresh(next);
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+  const particle = d.querySelector("#flow-pulses .flow-particle");
+  assert.ok(particle);
+  await refresh(next);
+  assert.strictEqual(d.querySelector("#flow-pulses .flow-particle"), particle);
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+  await waitFor(
+    () => d.querySelector("#loop-node .trace-step")?.textContent === "2",
+  );
+  assert.ok(d.querySelector('[data-flow="model"].selected'));
+  assert.equal(d.querySelectorAll(".trace-step").length, 1);
+});
+
+test("new messages auto-follow after event inspection but respect an explicitly pinned message", async (t) => {
+  const { d, refresh } = await page(t, fixture(), false, null, false);
+  let payload = incomingTurn(fixture(), "m3");
+  await refresh(payload);
+  d.querySelector('[data-interaction="input-m3"]').click();
+  payload = incomingTurn(payload, "m4");
+  await refresh(payload);
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m4");
+  assert.equal(
+    d.getElementById("follow-latest").getAttribute("aria-pressed"),
+    "true",
+  );
+  d.querySelector('[data-turn="m3"] .turn-select').click();
+  payload = incomingTurn(payload, "m5");
+  await refresh(payload);
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m3");
+  assert.equal(
+    d.getElementById("follow-latest").getAttribute("aria-pressed"),
+    "false",
+  );
+  d.getElementById("follow-latest").click();
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m5");
+  assert.equal(d.querySelector(".trace-step").textContent, "1");
+  payload = incomingTurn(payload, "m6");
+  await refresh(payload);
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m6");
+});
+
+for (const paused of [false, true]) {
+  test(`new input exits ${paused ? "paused" : "playing"} replay and follows its live handoffs`, async (t) => {
+    const payload = fixture();
+    const { d, refresh } = await page(t, payload, false, null, false);
+    d.querySelector('[data-turn="m1"] .replay-button').click();
+    await new Promise(setImmediate);
+    if (paused) d.querySelector('[data-turn="m1"] .replay-button').click();
+    assert.ok(d.querySelector(".replay-controls"));
+    await refresh(payload);
+    assert.ok(
+      d.querySelector(".replay-controls"),
+      "polling alone must not stop replay",
+    );
+    await refresh(incomingTurn(payload, "m3", true));
+    assert.equal(d.querySelector(".replay-controls"), null);
+    assert.equal(d.querySelector(".turn.selected").dataset.turn, "m3");
+    assert.equal(
+      d.getElementById("follow-latest").getAttribute("aria-pressed"),
+      "true",
+    );
+    assert.notEqual(
+      d.getElementById("connection-status").textContent,
+      "历史回放",
+    );
+    assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+    await waitFor(
+      () => d.querySelector("#loop-node .trace-step")?.textContent === "2",
+    );
+  });
+}
+
+test("new input cancels pending replay history so a late response cannot restore the old message", async (t) => {
+  const payload = fixture();
+  const { d, w, refresh } = await page(t, payload, false, null, false);
+  const originalFetch = w.fetch;
+  let resolveHistory;
+  w.fetch = (url, options) =>
+    url.includes("?message_id=")
+      ? new Promise((resolve) => {
+          resolveHistory = resolve;
+        })
+      : originalFetch(url, options);
+  d.querySelector('[data-turn="m1"] .replay-button').click();
+  assert.match(
+    d.querySelector('[data-turn="m1"] .replay-button').textContent,
+    /读取历史/,
+  );
+  await refresh(incomingTurn(payload, "m3", true));
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m3");
+  const history = withInteractions(structuredClone(payload));
+  history.message_id = "m1";
+  resolveHistory({ ok: true, json: async () => history });
+  await new Promise(setImmediate);
+  assert.equal(d.querySelector(".replay-controls"), null);
+  assert.equal(d.querySelector(".turn.selected").dataset.turn, "m3");
+  assert.equal(d.querySelector("#session-node .trace-step").textContent, "1");
+  await waitFor(
+    () => d.querySelector("#loop-node .trace-step")?.textContent === "2",
+  );
 });

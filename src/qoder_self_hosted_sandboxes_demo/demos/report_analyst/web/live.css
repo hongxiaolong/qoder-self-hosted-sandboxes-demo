@@ -954,6 +954,11 @@ pre {
   margin-top: 9px;
   font-size: var(--text-meta);
 }
+.live-progress {
+  width: 100%;
+  color: var(--blue);
+  font-variant-numeric: tabular-nums;
+}
 .turn-state {
   color: var(--muted);
 }
@@ -1217,7 +1222,9 @@ th:last-child {
   align-items: center;
   min-width: 0;
 }
-.operation-label > span:last-child {
+.operation-label > .operation-text {
+  min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1304,4 +1311,57 @@ th:last-child {
 }
 #trace-scope {
   margin-left: auto;
+}
+
+.flow-step-label {
+  flex-shrink: 0;
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.interaction-table table {
+  table-layout: fixed;
+}
+.interaction-table th:nth-child(1) {
+  width: 34%;
+}
+.interaction-table th:nth-child(2) {
+  width: 26%;
+}
+.interaction-table th:nth-child(3) {
+  width: 18%;
+}
+.interaction-table th:nth-child(4) {
+  width: 12%;
+}
+.interaction-table th:nth-child(5) {
+  width: 10%;
+}
+.interaction-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.interaction-table td.operation-name {
+  min-width: 0;
+  max-width: none;
+}
+
+.resource-node.sending:not(.selected),
+.input-pane.sending {
+  border-color: var(--blue);
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+
+.batch-tasks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 8px 0;
+}
+.batch-tasks button[aria-pressed="true"] {
+  background: var(--blue-soft);
 }

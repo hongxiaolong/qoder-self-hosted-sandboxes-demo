@@ -17,10 +17,10 @@ def tool(name, description, properties, required=()):
 
 
 TOOLS = [
-    tool("runtime_evidence", "Read the workspace identity and real Sandbox IDs.", {}),
+    tool("runtime_evidence", "Read workspace identity and real Sandbox IDs only when not already known. Reuse IDs from prior successful results; download_report also returns both IDs.", {}),
     tool(
         "download_report",
-        "Operate Chromium in the Browser Sandbox: open data portal, select month/region, paginate and download CSV. Copy the real downloaded file to analysis input.csv and return two hashes.",
+        "Operate Chromium in the Browser Sandbox, filter and download CSV to analysis input.csv. Returns both Sandbox IDs, matching file hashes, schema and up to three sample rows so analysis can normally run without a separate inspection call.",
         {
             "month": {"type": "string", "enum": ["2026-09", "2026-10"]},
             "region": {"type": "string", "enum": ["全部", "华东", "华南", "华北"]},
@@ -29,7 +29,7 @@ TOOLS = [
     ),
     tool(
         "run_python",
-        "Execute your generated Python code in the analysis Sandbox. CWD is the workspace; read input.csv and write analysis.json following the skill schema. pandas, plotly, openpyxl are installed.",
+        "Execute your generated Python code in the analysis Sandbox. Read input.csv and write analysis.json following the skill schema. Use download_report's schema/sample to normally analyze in one execution; inspect or retry when genuinely needed. pandas, plotly, openpyxl are installed.",
         {"code": {"type": "string"}},
         ["code"],
     ),

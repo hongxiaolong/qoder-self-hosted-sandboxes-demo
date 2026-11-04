@@ -468,3 +468,57 @@ class PreviewObservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(live['api_trace']['requests']),5)
         self.assertIn('future-input-body-marker',json.dumps(live))
         self.assertEqual(self.api.requests,[])
+
+    async def test_live_and_replay_share_component_handoffs_not_internal_records(self):
+        for index in range(50):
+            self.record('heartbeat_confirmed',work_id='work-a',ttl_seconds=60)
+            self.api.event('span.model_request_start',message_id=self.message['id'])
+        live=await (await self.client.get('/api/observer')).json()
+        replay=await (await self.client.get('/api/observer',params={'message_id':self.message['id']})).json()
+        a=next(item for item in live['interactions']['conversations'] if item['message_id']==self.message['id'])
+        b=next(item for item in replay['interactions']['conversations'] if item['message_id']==self.message['id'])
+        self.assertEqual(a['number'],1)
+        self.assertEqual(b['number'],1)
+        self.assertEqual(a['total_steps'],5)
+        self.assertEqual(b['total_steps'],5)
+        self.assertEqual([(s['id'],s['number']) for s in a['steps']],[(s['id'],s['number']) for s in b['steps']])
+        self.assertEqual(live['interactions']['version'],4)
+        raw={event['id']:event for event in live['events']}
+        kinds=[step['source_kind'] for step in a['steps']]
+        self.assertEqual(kinds,['user.message','agent.tool_use','tool_started','user.tool_result','agent.message'])
+        self.assertEqual([(s['source'],s['target']) for s in a['steps']],
+                         [('input','session'),('loop','events'),('events','worker'),('worker','events'),('loop','session')])
+        self.assertEqual(len({step['number'] for step in a['steps']}),5)
+        self.assertFalse(any(raw[key]['category'] in {'heartbeat','work','session','http'} for step in a['steps'] for key in step['event_ids']))
+        self.assertNotIn('_flow_events',live)
+        self.assertEqual(self.api.requests,[])
+
+    async def test_python_markers_keep_live_and_replay_component_endpoints_identical(self):
+        message = self.api.event('user.message', content=[dict(type='text', text='执行 Python')])
+        call = self.api.event('agent.custom_tool_use', name='run_python')
+        self.record('tool_start', tool='run_python', tool_use_id=call['id'], message_id=message['id'],
+                    input={'code':'print(42)'}, work_id='work-a')
+        self.record('tool_stage', stage='python_dispatch', tool_use_id=call['id'], role='analysis')
+        live = await (await self.client.get('/api/observer')).json()
+        first = next(c for c in live['interactions']['conversations'] if c['message_id'] == message['id'])
+        self.assertEqual([(s['source'],s['target']) for s in first['steps']],
+                         [('input','session'),('loop','events'),('events','worker'),('worker','python')])
+        self.record('tool_stage', stage='python_return', tool_use_id=call['id'], role='analysis')
+        self.record('tool_finished', tool='run_python', tool_use_id=call['id'], message_id=message['id'],
+                    output='exit_code=0\n42', elapsed_ms=4, work_id='work-a')
+        self.record('tool_posted', tool='run_python', tool_use_id=call['id'], work_id='work-a')
+        self.api.event('user.custom_tool_result', custom_tool_use_id=call['id'])
+        self.api.event('agent.message', content=[dict(type='text',text='完成')])
+        self.api.event('session.status_idle', stop_reason={'type':'end_turn'})
+        # Endpoint snapshots are intentionally cached for one second.
+        await asyncio.sleep(1.05)
+        live = await (await self.client.get('/api/observer')).json()
+        replay = await (await self.client.get('/api/observer',params={'message_id':message['id']})).json()
+        a = next(c for c in live['interactions']['conversations'] if c['message_id'] == message['id'])
+        b = replay['interactions']['conversations'][0]
+        self.assertEqual(a['total_steps'],7)
+        self.assertEqual([(s['id'],s['number'],s['source'],s['target'],s['flow']) for s in a['steps']],
+                         [(s['id'],s['number'],s['source'],s['target'],s['flow']) for s in b['steps']])
+        self.assertEqual({s['id']:s['number'] for s in first['steps']},
+                         {s['id']:s['number'] for s in a['steps'] if s['number'] <= 4})
+        self.assertEqual(self.api.requests,[])

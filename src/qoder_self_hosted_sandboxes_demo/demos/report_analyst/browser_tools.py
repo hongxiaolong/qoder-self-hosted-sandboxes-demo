@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from .analysis_tools import AnalysisTools
-from .data import read_rows, sha, atomic_json
+from .data import FIELDS, read_rows, sha, atomic_json
 
 
 class WebTools(AnalysisTools):
@@ -175,6 +175,8 @@ class WebTools(AnalysisTools):
             "bytes": len(data),
             "source_sha256": sha(data),
             "target_sha256": sha(dest.read_bytes()),
+            "schema": {"date": "YYYY-MM-DD", "category": "string", "region": "string", "amount": "decimal text"},
+            "sample_rows": [{field: str(row[field])[:120] for field in FIELDS} for row in rows[:3]],
             "filters": {
                 "month": args.get("month", "2026-10"),
                 "region": args.get("region", "华东"),

@@ -115,6 +115,16 @@ class AnalysisTests(unittest.TestCase):
             json.loads((self.root / "analysis.json").read_text())["executed"]
         )
 
+    def test_python_boundary_markers_follow_validation_and_real_execution(self):
+        stages = []
+        self.tools.observe = lambda stage, **values: stages.append(stage)
+        _, error = self.tools.execute("run_python", {"code": "x" * 50001})
+        self.assertTrue(error)
+        self.assertEqual(stages, [], "validation errors must not claim interpreter dispatch")
+        _, error = self.tools.execute("run_python", {"code": "print('boundary-check')"})
+        self.assertFalse(error)
+        self.assertEqual(stages, ["python_dispatch", "python_return"])
+
     def test_http_filter_download_and_path_restriction(self):
         server = create_server(self.root, 0, "127.0.0.1")
         threading.Thread(target=server.serve_forever, daemon=True).start()

@@ -214,13 +214,24 @@ def build_observation(status, session, execution, queue, *, clock=time.time, max
                       if _time(call.get(key)) is not None), None)
         role = call.get("role") if call.get("role") in {"analysis", "browser", "transfer"} else "analysis"
         source = dict(call, message_id=_id(call.get("message_id")) or _id(tools.get(tool_id, {}).get("message_id")))
-        if started is not None and finished is not None:
+        if _time(call.get("observed_at")) is not None:
+            add("execution-received:" + tool_id, "tool_received", "tool", "Worker 收到工具调用",
+                source=source, source_time=call["observed_at"], tool_id=tool_id, role="worker",
+                state="received", input=call.get("input", ""))
+        if started is not None:
             add("execution-start:" + tool_id, "tool_started", "tool", "开始执行 · " + call.get("title", "工具"),
                 source=source, source_time=started, tool_id=tool_id, role=role, state="running",
                 input=call.get("input", ""), code=call.get("code", ""))
-        add("execution:" + tool_id, "tool_execution", "tool", call.get("title", "本地工具执行"),
-            source=source, source_time=stamp, tool_id=tool_id, role=role, state=call.get("state"),
-            input=call.get("input", ""), code=call.get("code", ""), output=call.get("output", ""), elapsed_ms=elapsed)
+        if call.get("state") in {"completed", "failed", "error", "cancelled", "canceled", "posted", "denied"}:
+            # A cancellation after tool_finished stops result posting; it must
+            # not change the identity of the execution that already finished.
+            state = call.get("state")
+            if finished is not None and state in {"cancelled", "canceled"}:
+                state = "completed"
+            prefix = "execution-cancel:" if state in {"cancelled", "canceled"} else "execution:"
+            add(prefix + tool_id, "tool_execution", "tool", call.get("title", "本地工具执行"),
+                source=source, source_time=stamp, tool_id=tool_id, role=role, state=state,
+                input=call.get("input", ""), code=call.get("code", ""), output=call.get("output", ""), elapsed_ms=elapsed)
 
     runtime = [event for event in execution.get("runtime", []) if isinstance(event, dict)]
     runtime_labels = {"worker_ready":"Worker 已启动", "worker_polling":"Worker 开始轮询", "work_poll":"Worker 轮询 Work",
@@ -237,6 +248,8 @@ def build_observation(status, session, execution, queue, *, clock=time.time, max
         role = event.get("role") if category == "tool" and event.get("role") in {"analysis", "browser", "transfer"} else "worker"
         add(identifier, kind, category, runtime_labels[kind], source=event, tool_id=event.get("tool_use_id"), role=role,
             state=event.get("state") or event.get("result") or kind, output=event.get("detail") or event.get("error") or "")
+        if kind == "tool_stage":
+            events[identifier]["stage"] = public_text(event.get("stage", ""), 100)
 
     heartbeats = [event for event in runtime if event.get("kind") == "heartbeat_confirmed" and _time(event.get("time")) is not None]
     heartbeat = max(heartbeats, key=lambda event: _time(event["time"])) if heartbeats else None
@@ -260,6 +273,12 @@ def build_observation(status, session, execution, queue, *, clock=time.time, max
                 events=ordered[-max_events:], worker=worker, observed_at=now,
                 history_incomplete=bool(len(ordered)>max_events or session.get("history_incomplete") or session.get("truncated")
                                         or execution.get("history_incomplete") or execution.get("truncated")))
+    # The ordinal journal must see all available facts before the display window
+    # drops older rows. Pass identities only, never another copy of task content.
+    from .interactions import FLOW_KINDS
+    result["_flow_events"] = [{key:event.get(key) for key in
+        ("id", "kind", "category", "role", "message_id", "tool_id", "work_id", "state", "time", "observed_at", "label", "stage")}
+        for event in ordered if event["kind"] in FLOW_KINDS]
 
     from .tracing import enrich_observation
     return enrich_observation(result, api_trace)

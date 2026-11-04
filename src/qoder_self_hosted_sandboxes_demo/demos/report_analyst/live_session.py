@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
+from .interactions import interaction_catalog, project_interactions
 import sqlite3
 import time
 import uuid
@@ -82,6 +83,11 @@ class LiveSession:
                 yield connection
         finally:
             connection.close()
+
+    def project_interactions(self, observation):
+        """Persist task-flow identities once, shared by live and history views."""
+        with self.db() as db:
+            return project_interactions(observation, db)
 
     @contextmanager
     def locked(self, wait_seconds=0):
@@ -252,6 +258,7 @@ class LiveSession:
             history_incomplete = history_incomplete or bool(
                 needed - {event["id"] for event in events}
             )
+            catalog = interaction_catalog(db, events)
         turns, tools = [], {}
         by_id = {}
         terminal = False
@@ -297,12 +304,15 @@ class LiveSession:
                 terminal = True
                 if parent and parent["state"] in {"running", "waiting_tools"}:
                     parent["state"] = "stopped"
+        conversation_numbers = {item["message_id"]: item["number"] for item in catalog["conversations"]}
+        for turn in turns:
+            turn["number"] = conversation_numbers.get(turn["id"])
         # These records were projected before persistence: no raw parameters,
         # model responses, hidden reasoning, authentication or API envelopes.
         trace_fields = {"id", "type", "message_id", "time", "observed_at", "text", "tool",
                         "tool_use_id", "reason", "tool_ids", "model_request_start_id", "permission", "is_error"}
         trace = [{key: value for key, value in event.items() if key in trace_fields} for event in events]
-        return dict(turns=turns[-100:], tools=list(tools.values())[-300:], trace=trace,
+        return dict(turns=turns[-100:], tools=list(tools.values())[-300:], trace=trace, interaction_catalog=catalog,
                     history_incomplete=history_incomplete or len(turns) > 100 or len(tools) > 300,
                     active_message_id=active or None,
                     terminal=terminal or meta.get("terminal") == "true", observed_at=float(meta.get("observed_at", 0)), stale=bool(error), error=error)

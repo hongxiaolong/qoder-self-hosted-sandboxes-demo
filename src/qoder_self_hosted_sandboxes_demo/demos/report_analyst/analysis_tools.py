@@ -17,6 +17,7 @@ from qoder_self_hosted_sandboxes_demo.environments.self_hosted.tools import Tool
 class AnalysisTools(Tools):
     def __init__(self, workdir):
         super().__init__(workdir)
+        self.observe = lambda *_args, **_values: None
         (self.root / "artifacts").mkdir(exist_ok=True)
         (self.root / "evidence").mkdir(exist_ok=True)
 
@@ -25,9 +26,11 @@ class AnalysisTools(Tools):
         if len(code) > 50000:
             raise ValueError("Python source exceeds demo limit")
         (self.root / "analysis.py").write_text(code)
+        self.observe("python_dispatch", role="analysis", detail="Worker 向 Python 执行器提交代码")
         result = self.tool_bash(
             {"command": f"{sys.executable} analysis.py", "timeout": 90000}
         )
+        self.observe("python_return", role="analysis", detail="Python 执行器向 Worker 返回结果")
         return result
 
     def tool_append_record(self, args):

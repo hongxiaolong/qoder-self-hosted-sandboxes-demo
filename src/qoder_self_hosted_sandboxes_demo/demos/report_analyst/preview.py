@@ -244,6 +244,9 @@ async def create_app(config, status_provider=None, live_session=None, *, work_ob
             else:
                 cached = build_observation(current, session, executed, queue)
             cached = enrich_observation(cached, api_trace)
+            if live_session:
+                cached["interactions"] = await asyncio.to_thread(live_session.project_interactions, cached)
+            cached.pop("_flow_events", None)
             cached["message_id"] = message_id
             if current.get("state") != "ready":
                 cached["worker"]["state"] = "unknown"

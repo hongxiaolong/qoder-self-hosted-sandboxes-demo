@@ -7,6 +7,7 @@ from copy import deepcopy
 
 from .observation import _id, _number, _time
 from .lifecycle import public_history
+from .interactions import project_interactions
 from qoder_self_hosted_sandboxes_demo.qoder.telemetry import project_requests
 
 
@@ -100,7 +101,7 @@ def build_tracing(data, api_trace=None):
         if scope == "background" and row["operation"] in {"tool", "model", "stage"}:
             key = "unassigned"
         if key not in groups:
-            groups[key] = dict(id=key, label="未关联输入的操作" if key == "unassigned" else "准备资源" if scope == "setup" else "会话与后台活动" if scope == "background" else "本轮输入",
+            groups[key] = dict(id=key, label="未关联输入的操作" if key == "unassigned" else "准备资源" if scope == "setup" else "会话与后台活动" if scope == "background" else "对话",
                                scope=scope, rows=[])
             if scope == "turn":
                 groups[key]["message_id"] = message
@@ -285,5 +286,6 @@ def enrich_observation(data, api_trace=None):
     data["events"] = sorted(data.get("events", []), key=event_time)
     data["api_trace"] = captured
     data["tracing"] = build_tracing(data, captured)
+    data["interactions"] = project_interactions(data)
     data["history_incomplete"] = bool(data.get("history_incomplete") or captured["history_incomplete"])
     return data

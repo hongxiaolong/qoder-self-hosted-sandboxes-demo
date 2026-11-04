@@ -124,15 +124,17 @@ class ObservationTests(unittest.TestCase):
         before=deepcopy((self.session,self.execution))
         data=self.build()
         tool_events=[event for event in data['events'] if event['tool_id']=='tool_1']
-        self.assertEqual([event['kind'] for event in tool_events],['agent.custom_tool_use','tool_started','tool_execution','user.custom_tool_result'])
-        self.assertEqual(tool_events[0]['input'],'{"script":"analysis.py"}')
-        self.assertEqual(tool_events[1]['code'],'print(42)')
-        self.assertEqual(tool_events[2]['time'],19)
-        self.assertEqual(tool_events[1]['time'],18)
-        self.assertEqual(tool_events[3]['output'],'42')
-        self.assertEqual(tool_events[2]['elapsed_ms'],1200)
-        self.assertNotIn('elapsed_ms',tool_events[1])
-        self.assertNotIn('elapsed_ms',tool_events[0])
+        self.assertEqual([event['kind'] for event in tool_events],
+                         ['agent.custom_tool_use','tool_received','tool_started','tool_execution','user.custom_tool_result'])
+        phases = {event['kind']: event for event in tool_events}
+        self.assertEqual(phases['agent.custom_tool_use']['input'],'{"script":"analysis.py"}')
+        self.assertEqual(phases['tool_started']['code'],'print(42)')
+        self.assertEqual(phases['tool_execution']['time'],19)
+        self.assertEqual(phases['tool_started']['time'],18)
+        self.assertEqual(phases['user.custom_tool_result']['output'],'42')
+        self.assertEqual(phases['tool_execution']['elapsed_ms'],1200)
+        self.assertNotIn('elapsed_ms',phases['tool_started'])
+        self.assertNotIn('elapsed_ms',phases['agent.custom_tool_use'])
         self.assertEqual(before,(self.session,self.execution),'Inputs must not be mutated')
 
     def test_model_duration_requires_real_matching_start_and_end_ids(self):

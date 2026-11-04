@@ -3,6 +3,9 @@ from contextlib import contextmanager
 import fcntl
 import json
 import os
+import select
+import sys
+import threading
 import tempfile
 import time
 import uuid
@@ -63,7 +66,7 @@ def save_pending(path, pending):
             os.unlink(temporary)
 
 
-def submit(live, state, text=None, *, retry=False):
+def submit(live, state, text=None, *, retry=False, stopped=None):
     with pending_record(state) as (path, pending):
         if retry:
             if not pending:
@@ -78,9 +81,88 @@ def submit(live, state, text=None, *, retry=False):
                 save_pending(path, pending)
             except OSError as exc:
                 raise ChatError("消息未提交：无法保存本地重试记录，请检查磁盘或权限。", 500) from exc
+        if stopped is not None and stopped.is_set():
+            raise _ChatExit()
         receipt = live.send(pending["text"], pending["request_id"], source="terminal")
-        path.unlink()
+        if stopped is None or not stopped.is_set():
+            path.unlink()
         return receipt
+
+
+class _ChatExit(BaseException):
+    """Leave local chat without treating an unconfirmed submission as failed."""
+
+
+class _TerminalControl:
+    """The main thread owns terminal input; no reader survives into the menu.
+
+    A daemon runs one bounded network operation while the main thread accepts
+    /exit. We never join that daemon on exit, cancel cloud work or retry a send.
+    Non-TTY / one-shot callers keep the existing synchronous input behavior.
+    """
+    def __init__(self, enabled):
+        self.stopped = threading.Event()
+        self.fd = None
+        if enabled:
+            try:
+                if sys.stdin.isatty():
+                    self.fd = sys.stdin.fileno()
+            except (AttributeError, OSError, ValueError):
+                pass
+
+    def poll(self, timeout):
+        if self.fd is None:
+            time.sleep(timeout)
+            return
+        if not select.select([self.fd], [], [], timeout)[0]:
+            return
+        # Read one line, byte by byte: a pasted line intended for the parent
+        # menu must remain in the terminal, not in a background reader/buffer.
+        line = bytearray()
+        while select.select([self.fd], [], [], 0)[0]:
+            value = os.read(self.fd, 1)
+            if not value:
+                raise _ChatExit()
+            if value in (b"\n", b"\r"):
+                if line.decode("utf-8", errors="replace").strip() == "/exit":
+                    self.stopped.set()
+                    raise _ChatExit()
+                print("  正在等待 Qoder；输入 /exit 结束 chat 返回主菜单。", flush=True)
+                return
+            if len(line) < 64000:
+                line.extend(value)
+
+    def run(self, operation):
+        if self.fd is None:
+            return operation()
+        done, outcome = threading.Event(), []
+        def invoke():
+            try:
+                outcome.append((True, operation()))
+            except BaseException as exc:
+                outcome.append((False, exc))
+            finally:
+                done.set()
+        threading.Thread(target=invoke, daemon=True, name="chat-network").start()
+        try:
+            while not done.is_set():
+                self.poll(0.1)
+            self.poll(0)
+        except (KeyboardInterrupt, _ChatExit):
+            self.stopped.set()
+            raise
+        success, value = outcome[0]
+        if not success:
+            raise value
+        return value
+
+    def pause(self, seconds):
+        if self.fd is None:
+            time.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            self.poll(max(0, min(0.1, deadline - time.monotonic())))
 
 
 def chat(config, values, state, message=None, *, retry=False):
@@ -94,12 +176,19 @@ def chat(config, values, state, message=None, *, retry=False):
     bind_trace(live.client, state, values, mutations_only=True)
     once = message is not None or retry
     print("\n自由对话 · 复用当前 Qoder Session 与两个 Sandbox", flush=True)
-    print("输入 /retry 重试待确认提交，/discard 放弃本地重试记录，/back 返回收尾。", flush=True)
+    controls = _TerminalControl(enabled=not once)
+    if not once:
+        print("输入 /exit 结束 chat 返回主菜单；/retry 重试待确认提交，/discard 放弃本地重试记录。", flush=True)
     while True:
         try:
             text = "/retry" if retry else message if once else input("\n你 › ").strip()
-            if not once and text == "/back":
+            if not once and text == "/exit":
+                controls.stopped.set()
+                print("已结束 chat，返回主菜单。", flush=True)
                 return
+            if not once and text.startswith("/") and text not in {"/retry", "/discard"}:
+                print("未知指令。输入 /exit 结束 chat 返回主菜单；可用 /retry 或 /discard。", flush=True)
+                continue
             if not text:
                 if once:
                     raise ChatError("请输入 1–16000 字的消息。", 400)
@@ -112,7 +201,12 @@ def chat(config, values, state, message=None, *, retry=False):
                 continue
             if time.time() >= state["created_at"] + config["sandbox"]["timeout_seconds"]:
                 raise ChatError("本轮执行环境已到期，请返回收尾并回收资源。", 410)
-            receipt = submit(live, state, text, retry=retry or (not once and text == "/retry"))
+            receipt = controls.run(lambda: submit(live, state, text,
+                retry=retry or (not once and text == "/retry"),
+                stopped=controls.stopped if not once else None))
+        except _ChatExit:
+            print("已结束 chat，返回主菜单。已提交或待确认的消息保留，请在 Web 查看。", flush=True)
+            return
         except (EOFError, KeyboardInterrupt):
             if once:
                 raise RuntimeError("提交被中断；请使用 chat --retry 确认原消息。") from None
@@ -133,7 +227,7 @@ def chat(config, values, state, message=None, *, retry=False):
         seen = set()
         try:
             while time.monotonic() < deadline:
-                snapshot = live.snapshot()
+                snapshot = controls.run(live.snapshot)
                 turn = next((t for t in snapshot["turns"] if t["id"] == receipt["id"]), None)
                 for tool in snapshot["tools"]:
                     if tool["message_id"] == receipt["id"] and tool["id"] not in seen:
@@ -147,9 +241,12 @@ def chat(config, values, state, message=None, *, retry=False):
                 if snapshot["terminal"]:
                     print("会话已结束，请回收并重新创建资源。", flush=True)
                     return
-                time.sleep(1.5)
+                controls.pause(1.5)
             else:
                 print("等待已超时，任务可能仍在执行；请检查当前 Qoder 会话，避免重复提交。", flush=True)
+        except _ChatExit:
+            print("已结束 chat，返回主菜单。已提交任务继续执行，可在 Web 查看。", flush=True)
+            return
         except (EOFError, KeyboardInterrupt):
             if once:
                 raise RuntimeError("消息已提交，进度观察已中断；请检查当前 Qoder 会话。") from None

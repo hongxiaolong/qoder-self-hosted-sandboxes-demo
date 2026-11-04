@@ -8,6 +8,7 @@
     return e;
   };
   const resourceNodes = {
+    input: "input-node",
     agent: "agent-node",
     skill: "skills-node",
     session: "session-node",
@@ -50,13 +51,24 @@
     worker: {},
   };
   let selected = "",
+    selectedInteraction = "",
+    drawnInteraction = "",
     selectedTurn = "",
-    selectedResource = "",
+    selectedResource = "session",
     tab = "io",
-    traceView = "operations",
+    traceView = "interactions",
     selectedSpan = "",
     filter = "all",
     following = true;
+  // Default focus, automatic observation and an explicitly pinned conversation
+  // are different states. Inspecting an event must not pin future messages.
+  let pinnedTurn = false,
+    liveInitialized = false,
+    liveMessage = "",
+    liveSeen = 0,
+    liveCurrent = null,
+    livePending = [],
+    liveTimer;
   let lastSignature = "",
     turnsSignature = "",
     networkError = "",
@@ -370,33 +382,116 @@
     clearTimeout(replayTimer);
     if (replay) replay.playing = false;
   }
+  function stopLiveFlow() {
+    clearTimeout(liveTimer);
+    liveTimer = null;
+    livePending = [];
+  }
+  function liveDelay() {
+    return livePending.length > 8 ? 180 : 450;
+  }
+  function advanceLiveFlow() {
+    liveTimer = null;
+    if (!following || pinnedTurn || replay) return;
+    const step = livePending.shift();
+    if (!step) return;
+    liveCurrent = step;
+    selectedResource = "";
+    selectedTurn = "";
+    selectedSpan = "";
+    const event = step.event_ids
+      .map((id) => data.events.find((e) => e.id === id))
+      .find(Boolean);
+    selected = event?.id || "";
+    selectedInteraction = step.id;
+    render();
+    // Keep the current handoff visible even if another poll arrives immediately.
+    liveTimer = setTimeout(advanceLiveFlow, liveDelay());
+  }
+  function syncLiveFlow() {
+    const message =
+      data.session.turns?.at(-1)?.id || data.session.active_message_id || "";
+    const steps =
+      data.interactions?.conversations?.find((c) => c.message_id === message)
+        ?.steps || [];
+    if (!liveInitialized) {
+      liveInitialized = true;
+      liveMessage = message;
+      liveSeen = Math.max(0, ...steps.map((step) => step.number));
+      return; // Opening the page focuses Session; existing history is not replayed.
+    }
+    if (message !== liveMessage) {
+      // A new user message takes over replay, including paused playback and
+      // an in-flight history fetch. Invalidate late history responses as well.
+      if (replay || replayLoading) endReplay(true);
+      stopLiveFlow();
+      liveMessage = message;
+      liveSeen = 0;
+      liveCurrent = null;
+      if (!pinnedTurn && !replay && !replayLoading) {
+        following = true;
+        selectedTurn = "";
+        selected = selectedInteraction = "";
+        selectedResource = "session";
+        $("turns").scrollTop = $("turns").scrollHeight;
+      }
+    }
+    const added = steps.filter((step) => step.number > liveSeen);
+    liveSeen = Math.max(liveSeen, ...steps.map((step) => step.number));
+    if (!following || pinnedTurn || replay || replayLoading) return;
+    livePending.push(...added);
+    if (!liveTimer && livePending.length) advanceLiveFlow();
+  }
+  function followLatest() {
+    endReplay(true);
+    stopLiveFlow();
+    pinnedTurn = false;
+    following = true;
+    liveMessage =
+      data.session.turns?.at(-1)?.id || data.session.active_message_id || "";
+    selectedTurn = "";
+    const steps = conversation(liveMessage)?.steps || [];
+    liveCurrent = steps.at(-1) || null;
+    liveSeen = Math.max(0, ...steps.map((step) => step.number));
+    selectedResource = liveCurrent ? "" : "session";
+    selected = selectedInteraction = "";
+    lastSignature = "";
+    render();
+  }
   function endReplay(clearScope = false) {
     pauseReplay();
     replay = null;
+    selectedInteraction = "";
     replayLoading = "";
     replayError = "";
     replayGeneration++;
-    if (clearScope) selectedTurn = "";
+    if (clearScope) {
+      selectedTurn = "";
+      pinnedTurn = false;
+    }
     turnsSignature = lastSignature = "";
   }
   function advanceReplay() {
     if (!replay || !replay.playing) return;
-    if (replay.cursor >= replay.events.length - 1) {
+    if (replay.cursor >= replay.frames.length - 1) {
       replay.playing = false;
       render();
       return;
     }
     replay.cursor++;
-    selected = replay.events[replay.cursor].id;
+    selected = replay.frames[replay.cursor].id;
+    selectedInteraction = replay.steps[replay.cursor].id;
     selectedResource = "";
     render();
     replayTimer = setTimeout(advanceReplay, 850);
   }
   async function startReplay(turn) {
+    stopLiveFlow();
     endReplay();
     const generation = replayGeneration;
     replayLoading = turn.id;
     selectedTurn = turn.id;
+    pinnedTurn = true;
     following = false;
     selectedResource = "";
     filter = "all";
@@ -423,7 +518,29 @@
       )
         throw new Error();
       if (generation !== replayGeneration) return;
+      const entry = history.interactions?.conversations?.find(
+        (item) => item.message_id === turn.id,
+      );
+      const records = new Map(history.events.map((event) => [event.id, event]));
+      const steps = (entry?.steps || []).filter((step) =>
+        step.event_ids.some((id) => records.has(id)),
+      );
+      const frames = steps
+        .map((step) => {
+          const record = step.event_ids
+            .map((id) => records.get(id))
+            .find(Boolean);
+          return (
+            record && { ...record, interaction_id: step.id, label: step.label }
+          );
+        })
+        .filter(Boolean);
+      if (history.interactions?.version !== 4 || !frames.length)
+        throw new Error("Task flow history unavailable");
       replay = {
+        interactions: history.interactions,
+        steps,
+        frames,
         messageId: turn.id,
         events: history.events,
         execution: history.execution || { events: [] },
@@ -434,7 +551,8 @@
         playing: true,
         incomplete: history.history_incomplete,
       };
-      selected = replay.events[0].id;
+      selected = replay.frames[0].id;
+      selectedInteraction = replay.steps[0].id;
       replayTimer = setTimeout(advanceReplay, 850);
     } catch {
       if (generation === replayGeneration)
@@ -449,10 +567,126 @@
       }
     }
   }
+  function conversations() {
+    const catalog = replay ? replay.interactions : data.interactions;
+    return catalog?.version === 4 ? catalog.conversations || [] : [];
+  }
+  function conversation(messageId) {
+    return conversations().find((item) => item.message_id === messageId);
+  }
+  function stepsForEvent(event) {
+    if (!event) return [];
+    return conversations().flatMap((entry) =>
+      entry.steps
+        .filter((step) => step.event_ids.includes(event.id))
+        .map((step) => ({ ...step, conversation: entry })),
+    );
+  }
+  function stepForEvent(event) {
+    const steps = stepsForEvent(event);
+    const explicit =
+      event?.interaction_id ||
+      (event?.id === selected ? selectedInteraction : "");
+    return steps.find((step) => step.id === explicit) || steps.at(-1) || null;
+  }
+  function eventProgress(event) {
+    const step = stepForEvent(event);
+    if (!step) return null;
+    return {
+      messageId: step.conversation.message_id,
+      index: step.number,
+      total: step.conversation.total_steps,
+      partial: step.conversation.partial,
+      label: step.conversation.partial ? "交互（部分记录）" : "交互",
+    };
+  }
+  function flowLabel(events) {
+    const numbers = [
+      ...new Set(
+        events.flatMap((event) =>
+          stepsForEvent(event).map((step) => step.number),
+        ),
+      ),
+    ].sort((a, b) => a - b);
+    return numbers.length
+      ? numbers.length > 1
+        ? numbers.length + " 次交互"
+        : "交互 " + numbers[0]
+      : events.some((event) =>
+            ["heartbeat", "work", "resource"].includes(event.category),
+          )
+        ? "后台 / 准备"
+        : events.some((event) =>
+              ["tool", "model", "session"].includes(event.category),
+            )
+          ? "组件内部"
+          : "诊断记录";
+  }
+  function latestInputEvent(events) {
+    const messageId =
+      selectedTurn ||
+      (following && liveMessage) ||
+      data.session.active_message_id ||
+      data.session.turns?.at(-1)?.id;
+    let steps = conversation(messageId)?.steps || [];
+    if (!replay && following && liveCurrent && messageId === liveMessage)
+      steps = steps.filter((step) => step.number <= liveCurrent.number);
+    const visible = new Map(events.map((event) => [event.id, event]));
+    for (const step of [...steps].reverse())
+      for (const id of [...step.event_ids].reverse())
+        if (visible.has(id))
+          return { ...visible.get(id), interaction_id: step.id };
+    return events.at(-1);
+  }
+  function replayFuture(event) {
+    if (!replay) return false;
+    const candidates = stepsForEvent(event);
+    // A legacy completion can prove both invocation and return. Its output is
+    // visible at the return boundary, never at the earlier inferred invocation.
+    if (event.kind === "tool_execution" && event.tool_id) {
+      const returned = replay.steps.findIndex(
+        (step) =>
+          step.tool_id === event.tool_id && step.flow === "python-result",
+      );
+      if (returned >= 0) return returned > replay.cursor;
+      const posted = replay.steps.findIndex(
+        (step) => step.tool_id === event.tool_id && step.flow === "result",
+      );
+      return posted < 0 || posted > replay.cursor;
+    }
+    if (candidates.length)
+      return candidates.every(
+        (step) =>
+          replay.steps.findIndex((item) => item.id === step.id) > replay.cursor,
+      );
+    const anchor = replay.events.findIndex(
+      (item) => item.id === replay.frames[replay.cursor]?.id,
+    );
+    return replay.events.indexOf(event) > anchor;
+  }
+  function replayStepIndex() {
+    const step = stepForEvent(replay?.frames[replay.cursor]);
+    return step ? replay.steps.findIndex((item) => item.id === step.id) : -1;
+  }
+  function seekReplayStep(delta) {
+    const next = replay.steps[replayStepIndex() + delta];
+    if (!next) return;
+    pauseReplay();
+    replay.cursor = replay.steps.indexOf(next);
+    selected = replay.frames[replay.cursor].id;
+    selectedInteraction = replay.steps[replay.cursor].id;
+    selectedResource = "";
+    render();
+  }
   function renderTurns() {
     const turns = data.session.turns || [],
+      progress =
+        !replay && !selectedResource
+          ? eventProgress(data.events.find((event) => event.id === selected))
+          : null,
       signature = JSON.stringify([
-        turns.map((t) => [t.id, t.text, t.source, t.state]),
+        progress,
+        turns.map((t) => [t.id, t.number, t.text, t.source, t.state]),
         selectedTurn,
         replay && [replay.messageId, replay.cursor, replay.playing],
         replayLoading,
@@ -480,7 +714,10 @@
     for (const turn of turns) {
       const card = make(
         "article",
-        "turn" + (selectedTurn === turn.id ? " selected" : ""),
+        "turn" +
+          ((selectedTurn || (following && liveMessage)) === turn.id
+            ? " selected"
+            : ""),
       );
       card.dataset.turn = turn.id;
       const button = make("button", "turn-select");
@@ -488,7 +725,12 @@
       button.dataset.focusKey = turn.id + ":select";
       const meta = make("div", "turn-meta");
       meta.append(
-        make("time", "", clock(turn.time || turn.observed_at)),
+        make(
+          "time",
+          "",
+          (turn.number ? "对话 " + turn.number + " · " : "对话 · ") +
+            clock(turn.time || turn.observed_at),
+        ),
         make(
           "span",
           "turn-source",
@@ -501,8 +743,10 @@
       );
       button.append(meta, make("p", "", turn.text));
       card.onclick = () => {
+        stopLiveFlow();
         endReplay();
         selectedTurn = turn.id;
+        pinnedTurn = true;
         selectedResource = "";
         following = false;
         selected = "";
@@ -516,7 +760,7 @@
         playing
           ? replay.playing
             ? "暂停回放"
-            : replay.cursor === replay.events.length - 1
+            : replay.cursor === replay.frames.length - 1
               ? "重新回放"
               : "继续回放"
           : replayLoading === turn.id
@@ -538,9 +782,10 @@
         }
         if (replay.playing) pauseReplay();
         else {
-          if (replay.cursor === replay.events.length - 1) replay.cursor = 0;
+          if (replay.cursor === replay.frames.length - 1) replay.cursor = 0;
           replay.playing = true;
-          selected = replay.events[replay.cursor].id;
+          selected = replay.frames[replay.cursor].id;
+          selectedInteraction = replay.steps[replay.cursor].id;
           replayTimer = setTimeout(advanceReplay, 850);
         }
         render();
@@ -559,43 +804,54 @@
         ),
         replayButton,
       );
+      if (progress?.messageId === turn.id) {
+        const summary = make(
+          "span",
+          "live-progress",
+          progress.label +
+            " " +
+            progress.index +
+            " · 已发生 " +
+            progress.total +
+            " 次交互",
+        );
+        summary.title =
+          "仅统计组件之间的实际传递；组件内部状态、模型计算与后台心跳不增加编号";
+        footer.append(summary);
+      }
       if (playing) {
         const progress = make("div", "replay-controls");
-        const previous = make("button", "", "上一事件"),
-          next = make("button", "", "下一事件"),
+        const previous = make("button", "", "上一步"),
+          next = make("button", "", "下一步"),
           live = make("button", "", "返回实时");
         previous.dataset.focusKey = turn.id + ":previous";
         next.dataset.focusKey = turn.id + ":next";
         live.dataset.focusKey = turn.id + ":live";
-        previous.disabled = replay.cursor === 0;
-        next.disabled = replay.cursor === replay.events.length - 1;
+        previous.disabled = replayStepIndex() <= 0;
+        next.disabled = replayStepIndex() === replay.steps.length - 1;
         for (const [control, delta] of [
           [previous, -1],
           [next, 1],
         ])
           control.onclick = (event) => {
             event.stopPropagation();
-            pauseReplay();
-            replay.cursor += delta;
-            selected = replay.events[replay.cursor].id;
-            selectedResource = "";
-            render();
+            seekReplayStep(delta);
           };
         live.onclick = (event) => {
           event.stopPropagation();
-          endReplay(true);
-          following = true;
-          render();
+          followLatest();
         };
         progress.append(
           make(
             "span",
             "",
             (replay.incomplete ? "部分历史 · " : "") +
-              (replay.cursor + 1) +
+              "交互 " +
+              (eventProgress(replay.frames[replay.cursor])?.index || "—") +
               " / " +
-              replay.events.length +
-              " 事件" +
+              (conversation(replay.messageId)?.total_steps || "—") +
+              " · " +
+              replay.frames[replay.cursor].label +
               (filteredEvents().some((event) => event.id === selected)
                 ? ""
                 : " · 当前步骤被筛选隐藏"),
@@ -670,7 +926,9 @@
   function displayedOperation(original) {
     if (!replay || !original.event_ids.length) return original;
     const past = new Set(
-      replay.events.slice(0, replay.cursor + 1).map((event) => event.id),
+      replay.events
+        .filter((event) => !replayFuture(event))
+        .map((event) => event.id),
     );
     const phases = replay.events.filter(
       (event) => original.event_ids.includes(event.id) && past.has(event.id),
@@ -710,6 +968,10 @@
     return row;
   }
   function renderEvents() {
+    if (traceView === "interactions") {
+      renderInteractions();
+      return;
+    }
     if (traceView === "events" || !traceModel()?.groups) {
       setTraceColumns(false);
       renderRawEvents();
@@ -728,6 +990,7 @@
       .filter((group) => group.rows.length);
     const active =
       selectedTurn ||
+      (following && liveMessage) ||
       data.session.active_message_id ||
       groups.filter((group) => group.scope === "turn").at(-1)?.message_id;
     if (following && !selectedResource) {
@@ -735,11 +998,16 @@
         groups.find((item) => item.message_id === active) ||
         groups.find((item) => item.scope === "setup") ||
         groups.at(-1);
-      const latest = group?.rows
-        .filter((row) => !row.parent_id && row.operation !== "stage")
-        .at(-1);
-      selected = latest?.event_ids.at(-1) || "";
-      selectedSpan = latest?.id || "";
+      const ids = new Set(group?.rows.flatMap((row) => row.event_ids) || []);
+      const latest = latestInputEvent(
+        rows.filter((event) => ids.has(event.id)),
+      );
+      selected = latest?.id || "";
+      selectedInteraction = latest?.interaction_id || "";
+      const matches =
+        group?.rows.filter((row) => row.event_ids.includes(selected)) || [];
+      selectedSpan =
+        (matches.find((row) => row.parent_id) || matches[0])?.id || "";
     } else if (!rows.some((event) => event.id === selected) && !replay) {
       selected = "";
       selectedSpan = "";
@@ -749,6 +1017,7 @@
       groups,
       selected,
       selectedResource,
+      selectedInteraction,
       replay?.cursor,
       following,
       [...groupExpansion],
@@ -784,10 +1053,15 @@
       toggle.textContent =
         (open ? "▾ " : "▸ ") +
         (group.scope === "turn"
-          ? "本轮输入 · " + (turn?.text || group.message_id).slice(0, 48)
+          ? "对话 " +
+            (conversation(group.message_id)?.number || turn?.number || "") +
+            " · " +
+            (turn?.text || group.message_id).slice(0, 48)
           : group.label) +
         "  ·  " +
-        group.rows.length;
+        (group.scope === "turn" && conversation(group.message_id)
+          ? conversation(group.message_id).total_steps + " 次交互"
+          : group.rows.length + " 条记录");
       toggle.title = group.message_id || group.label;
       toggle.setAttribute("aria-expanded", String(open));
       toggle.onclick = () => {
@@ -852,10 +1126,14 @@
         } else line.append(make("span", "row-toggle-spacer"));
         line.append(
           make("i", "event-state " + (failed(row) ? "error" : row.state)),
-          make("span", "", row.label),
+          make("span", "operation-text", row.label),
         );
+        const stepLabel = flowLabel(
+          timeline().filter((event) => row.event_ids.includes(event.id)),
+        );
+        line.append(make("span", "flow-step-label", stepLabel));
         name.append(line);
-        name.title = row.label;
+        name.title = row.label + " · " + stepLabel;
         const state = make(
           "td",
           "operation-state",
@@ -983,6 +1261,142 @@
     if (replay)
       body.querySelector(".selected")?.scrollIntoView?.({ block: "nearest" });
   }
+  function renderInteractions() {
+    setTraceColumns(true);
+    ["交互", "发送 → 接收", "关联工具", "记录时间", "状态"].forEach(
+      (label, i) =>
+        (document.querySelectorAll("#event-list th")[i].textContent = label),
+    );
+    rows = filteredEvents();
+    const visible = new Map(rows.map((event) => [event.id, event]));
+    const entries = conversations().flatMap((entry) =>
+      entry.steps
+        .filter((step) => step.event_ids.some((id) => visible.has(id)))
+        .map((step) => ({ ...step, conversation: entry })),
+    );
+    if (following && !selectedResource) {
+      const latest = latestInputEvent(rows);
+      selected = latest?.id || "";
+      selectedInteraction = latest?.interaction_id || "";
+    } else if (!replay && !visible.has(selected)) {
+      selected = selectedInteraction = "";
+    }
+    const signature = JSON.stringify([
+      "interactions",
+      entries,
+      selectedInteraction,
+      selectedResource,
+      replay?.cursor,
+      following,
+      rows.map((event) => [event.id, event.state]),
+    ]);
+    if (signature === lastSignature) return;
+    lastSignature = signature;
+    const body = $("event-rows"),
+      scroll = $("event-list").scrollTop;
+    body.replaceChildren();
+    const names = {
+      input: "会话输入",
+      session: "Session",
+      loop: "Agent Loop",
+      events: "Events API",
+      worker: "Worker",
+      python: "Python",
+      browser: "Browser",
+    };
+    for (const step of entries) {
+      const event = step.event_ids.map((id) => visible.get(id)).find(Boolean);
+      const future =
+        replay &&
+        replay.steps.findIndex((item) => item.id === step.id) > replay.cursor;
+      const active =
+        !selectedResource &&
+        selectedInteraction === step.id &&
+        step.event_ids.includes(selected);
+      const row = make(
+        "tr",
+        (active ? "selected " : "") + (future ? "future" : ""),
+      );
+      row.dataset.event = event.id;
+      row.dataset.interaction = step.id;
+      row.tabIndex = 0;
+      row.setAttribute("role", "button");
+      row.setAttribute("aria-selected", String(active));
+      const label =
+        "对话 " + step.conversation.number + " · 交互 " + step.number;
+      row.setAttribute("aria-label", label + " · " + step.label);
+      row.append(
+        make(
+          "td",
+          "operation-name",
+          label +
+            " · " +
+            (step.label || step.source + " → " + step.target)
+              .split("·")
+              .at(-1)
+              .trim(),
+        ),
+        make(
+          "td",
+          "",
+          (names[step.source] || step.source) +
+            " → " +
+            (names[step.target] || step.target),
+        ),
+        make(
+          "td",
+          "",
+          step.tool_ids?.length > 1
+            ? step.tool_ids.length + " 项工具任务"
+            : step.tool_id || "—",
+        ),
+        make(
+          "td",
+          "",
+          Number.isFinite(event.time) && !future ? clock(event.time) : "—",
+        ),
+        make("td", "", future ? "尚未发生" : "已记录"),
+      );
+      row.title = step.label;
+      row.children[2].title =
+        step.tool_ids?.join("\n") || step.tool_id || "没有关联工具";
+      const choose = () => selectEvent(event.id, false, "", step.id);
+      row.onclick = choose;
+      row.onkeydown = (key) => {
+        if (["Enter", " "].includes(key.key)) {
+          key.preventDefault();
+          choose();
+        } else if (["ArrowUp", "ArrowDown"].includes(key.key)) {
+          key.preventDefault();
+          const next =
+            entries[entries.indexOf(step) + (key.key === "ArrowDown" ? 1 : -1)];
+          const fact = next?.event_ids
+            .map((id) => visible.get(id))
+            .find(Boolean);
+          if (fact) selectEvent(fact.id, true, "", next.id);
+        }
+      };
+      body.append(row);
+    }
+    $("event-list").scrollTop = following
+      ? $("event-list").scrollHeight
+      : scroll;
+    $("events-empty").hidden = entries.length > 0;
+    text(
+      "events-empty",
+      "当前没有组件交互；内部状态和后台活动可切换执行视图查看。",
+    );
+    text("event-count", entries.length + " 次交互");
+    $("trace-scope").value = selectedTurn ? "input" : "session";
+    $("trace-scope").querySelector('option[value="input"]').disabled =
+      !selectedTurn;
+    $("follow-latest").setAttribute("aria-pressed", String(following));
+    $("history-note").hidden = !(replay
+      ? replay.incomplete
+      : data.history_incomplete);
+    if (replay)
+      body.querySelector(".selected")?.scrollIntoView?.({ block: "nearest" });
+  }
   function setTraceColumns(operations) {
     const labels = operations
       ? ["操作 / 阶段", "执行位置", "状态", "记录时间线", "耗时"]
@@ -991,6 +1405,10 @@
       .querySelectorAll("#event-list th")
       .forEach((heading, index) => (heading.textContent = labels[index]));
     $("event-list").classList.toggle("operation-table", operations);
+    $("event-list").classList.toggle(
+      "interaction-table",
+      traceView === "interactions",
+    );
   }
   function filteredEvents() {
     const search = $("event-search").value.trim().toLocaleLowerCase();
@@ -1026,10 +1444,24 @@
       );
     return events;
   }
-  function selectEvent(identifier, focus = false, operationId = "") {
+  function selectEvent(
+    identifier,
+    focus = false,
+    operationId = "",
+    interactionId = "",
+  ) {
+    stopLiveFlow();
     pauseReplay();
-    if (replay) {
-      const index = replay.events.findIndex((e) => e.id === identifier);
+    const event = timeline().find((item) => item.id === identifier);
+    // Raw records may prove consecutive handoffs (delivery, then Python call).
+    // Manual inspection chooses the most specific boundary; playback carries
+    // an explicit interaction ID so those two steps never collapse together.
+    selectedInteraction =
+      interactionId || stepsForEvent(event).at(-1)?.id || "";
+    if (replay && selectedInteraction) {
+      const index = replay.steps.findIndex(
+        (step) => step.id === selectedInteraction,
+      );
       if (index >= 0) replay.cursor = index;
     }
     selected = identifier;
@@ -1043,8 +1475,11 @@
   function renderRawEvents() {
     rows = filteredEvents();
     const keep = rows.find((e) => e.id === selected);
-    if (following && !selectedResource) selected = rows.at(-1)?.id || "";
-    else if (!keep && !replay) selected = "";
+    if (following && !selectedResource) {
+      const latest = latestInputEvent(rows);
+      selected = latest?.id || "";
+      selectedInteraction = latest?.interaction_id || "";
+    } else if (!keep && !replay) selected = "";
     const signature = JSON.stringify([
       rows.map((e) => [
         e.id,
@@ -1055,6 +1490,7 @@
         protocolFor(e),
       ]),
       selected,
+      selectedInteraction,
       following,
       replay?.cursor,
     ]);
@@ -1064,7 +1500,7 @@
       scroll = $("event-list").scrollTop;
     body.replaceChildren();
     for (const event of rows) {
-      const future = !!replay && replay.events.indexOf(event) > replay.cursor;
+      const future = replayFuture(event);
       const row = make(
         "tr",
         (event.id === selected ? "selected" : "") + (future ? " future" : ""),
@@ -1092,6 +1528,7 @@
         make("i", "event-state " + (future ? "future" : event.state)),
         document.createTextNode(name),
       );
+      label.append(make("span", "flow-step-label", flowLabel([event])));
       label.title = event.label;
       const api = protocolFor(event),
         endpoint = make("td", "api-cell");
@@ -1290,6 +1727,8 @@
     return null;
   }
   function sourceRecord(event) {
+    if (event.saved_evidence)
+      return { label: "Worker 交互证据 · 仅保存元数据", value: event };
     const captured = recordedRequest(event);
     if (captured) return { label: "HTTP attempt · 脱敏采集", value: captured };
     const session = replay ? replay.session : data.session;
@@ -1311,7 +1750,9 @@
   }
   function visiblePhases(row) {
     const events = timeline();
-    const visible = replay ? events.slice(0, replay.cursor + 1) : events;
+    const visible = replay
+      ? events.filter((event) => !replayFuture(event))
+      : events;
     return row
       ? visible.filter((event) => row.event_ids.includes(event.id))
       : [];
@@ -1331,20 +1772,45 @@
               : item,
       };
     }
-    const event = timeline().find((item) => item.id === selected);
-    if (!event) return { key: "empty" };
+    const original = timeline().find((item) => item.id === selected);
+    if (!original) return { key: "empty" };
+    const event = { ...original };
+    const concealed = replay && replayFuture(original);
+    if (concealed) {
+      delete event.output;
+      delete event.elapsed_ms;
+      event.state = "future";
+    }
     const row = currentOperation(),
-      phases = row ? visiblePhases(row) : [event];
+      phases = row ? visiblePhases(row) : concealed ? [] : [event];
     const call = {
       ...(executions().find((item) => item.id === event.tool_id) || {}),
     };
-    const cutoff = replay ? (event.time ?? event.observed_at) : Infinity;
-    if (replay && call.finished_at > cutoff) {
-      delete call.output;
-      delete call.finished_at;
-      delete call.elapsed_ms;
+    if (replay && event.tool_id) {
+      const known = timeline().filter(
+        (item) => item.tool_id === event.tool_id && !replayFuture(item),
+      );
+      const finished = known.some(
+        (item) =>
+          (item.kind === "tool_execution" && item.state !== "running") ||
+          (item.kind === "tool_stage" && item.stage === "python_return"),
+      );
+      if (!finished) {
+        delete call.output;
+        delete call.finished_at;
+        delete call.elapsed_ms;
+      }
+      if (
+        !known.some((item) =>
+          [
+            "user.tool_result",
+            "user.custom_tool_result",
+            "agent.tool_result",
+          ].includes(item.kind),
+        )
+      )
+        delete call.posted_at;
     }
-    if (replay && call.posted_at > cutoff) delete call.posted_at;
     const captured = recordedRequest(event);
     return {
       key: row?.id || event.id,
@@ -1383,7 +1849,7 @@
               view.record?.stats,
             ]
           : [view, view.item ? data.observed_at : null];
-    const signature = JSON.stringify([tab, fingerprint]);
+    const signature = JSON.stringify([tab, selectedInteraction, fingerprint]);
     if (signature === detailSignature) return;
     const same = detailKey === view.key + ":" + tab,
       scroll = host.scrollTop;
@@ -1422,8 +1888,43 @@
     }
     const { event, row, item, call = {}, captured, api, phases = [] } = view;
     const title = make("div", "detail-title");
-    title.append(make("h3", "", item?.name || row?.label || event.kind));
+    title.append(
+      make(
+        "h3",
+        "",
+        item?.name || stepForEvent(event)?.label || row?.label || event.kind,
+      ),
+    );
     host.append(title);
+    const interaction = !item && stepForEvent(event);
+    if (interaction?.tool_ids?.length > 1) {
+      const tasks = make("div", "batch-tasks");
+      tasks.setAttribute("aria-label", "本批工具任务");
+      for (const id of interaction.tool_ids) {
+        const fact = timeline().find(
+          (record) =>
+            interaction.event_ids.includes(record.id) && record.tool_id === id,
+        );
+        const tool =
+          executions().find((call) => call.id === id) ||
+          data.session.tools?.find((call) => call.id === id);
+        const button = make("button", "text-link", tool?.tool || id);
+        button.title = id;
+        button.setAttribute("aria-pressed", String(event.tool_id === id));
+        button.disabled = !fact;
+        button.onclick = () => selectEvent(fact.id, false, "", interaction.id);
+        tasks.append(button);
+      }
+      host.append(
+        make(
+          "p",
+          "detail-note",
+          interaction.tool_ids.length +
+            " 项工具任务 · 同一轮发布，点击查看各自输入输出",
+        ),
+        tasks,
+      );
+    }
     if (row)
       host.append(
         make(
@@ -1639,18 +2140,21 @@
       .filter(Boolean)
       .join(" · ");
     renderResources();
-    renderTurns();
     renderEvents();
+    renderTurns();
     renderDetail();
     if (replay) {
       text("loop-status", "历史回放");
       text("worker-status", "历史观测模式");
     }
-    requestAnimationFrame(draw);
+    draw();
   }
   // A single mapping drives event selection, the active flow and replay step badges.
   function eventContext(event) {
     if (!event) return { target: "", flow: "" };
+    const interaction = stepForEvent(event);
+    if (interaction)
+      return { target: interaction.target, flow: interaction.flow };
     const captured = recordedRequest(event);
     if (captured) {
       const id = captured.response?.body?.id;
@@ -1713,6 +2217,12 @@
     svg.setAttribute("viewBox", "0 0 " + root.width + " " + root.height);
     layer.replaceChildren();
     const ns = "http://www.w3.org/2000/svg";
+    let pulses = $("flow-pulses");
+    if (!pulses) {
+      pulses = document.createElementNS(ns, "g");
+      pulses.id = "flow-pulses";
+      svg.append(pulses);
+    }
     const point = (id, side = "right") => {
       const r = $(id)?.getBoundingClientRect();
       if (!r) return null;
@@ -1732,35 +2242,33 @@
       };
     };
     const event = timeline().find((e) => e.id === selected);
-    const operation = selected ? currentOperation() : null;
-    const context =
-      !replay && operation?.operation === "tool"
-        ? {
-            ...event,
-            kind: "tool_execution",
-            category: "tool",
-            role: operation.role,
-            tool_id: operation.tool_id,
-          }
-        : event;
-    const { target, flow } = eventContext(context);
+    const { target, flow } = eventContext(event);
+    const interaction = !selectedResource && stepForEvent(event);
     document
       .querySelectorAll("[data-resource].selected")
       .forEach((element) => element.classList.remove("selected"));
+    document
+      .querySelectorAll(".sending")
+      .forEach((element) => element.classList.remove("sending"));
+    if (interaction)
+      $(resourceNodes[interaction.source])?.classList.add("sending");
     document
       .querySelectorAll(".trace-step")
       .forEach((element) => element.remove());
     const node = $(resourceNodes[selectedResource || target]);
     node?.classList.add("selected");
-    if (node && replay && !selectedResource) {
-      const step = make("span", "trace-step", String(replay.cursor + 1));
+    const progress = !selectedResource && eventProgress(event);
+    if (node && progress) {
+      const step = make("span", "trace-step", String(progress.index));
       step.title =
-        "步骤 " +
-        (replay.cursor + 1) +
+        progress.label +
+        " " +
+        progress.index +
         "/" +
-        replay.events.length +
+        progress.total +
         " · " +
-        event.label;
+        stepForEvent(event).label;
+      step.setAttribute("aria-label", step.title);
       node.append(step);
     }
     const paths = {};
@@ -1773,8 +2281,7 @@
       );
       line.dataset.flow = key;
       layer.append(line);
-      if (key === "loop-events")
-        line.setAttribute("marker-start", "url(#flow-arrow)");
+
       paths[key] = d;
     }
     function curve(a, b, color, key) {
@@ -1834,12 +2341,22 @@
       "binding",
       "session-work",
     );
-    curve(
-      point("loop-node", "right"),
-      point("events-node", "left"),
-      "tool",
-      "loop-events",
-    );
+    const loopOut = point("loop-node", "right"),
+      eventsIn = point("events-node", "left");
+    if (loopOut && eventsIn) {
+      curve(
+        { ...loopOut, y: loopOut.y - 5 },
+        { ...eventsIn, y: eventsIn.y - 5 },
+        "tool",
+        "loop-events",
+      );
+      curve(
+        { ...eventsIn, y: eventsIn.y + 5 },
+        { ...loopOut, y: loopOut.y + 5 },
+        "result",
+        "events-loop",
+      );
+    }
     const worker = point("worker-node", "left"),
       analysis = point("analysis-node", "left");
     const queue = point("queue-node", "right"),
@@ -1851,7 +2368,7 @@
         ["request", events, 0, 0.5, "tool"],
         ["result", events, 18, 0.78, "result"],
       ]) {
-        const start = { x: analysis.x, y: worker.y + shift };
+        const start = { x: worker.x, y: worker.y + shift };
         const end = {
           x: target.x,
           y: target.y + (key === "request" ? -12 : key === "result" ? 12 : 0),
@@ -1867,22 +2384,42 @@
         );
       }
     }
-    curve(
-      point("worker-node", "right"),
-      point("python-node", "left"),
-      "tool",
-      "python",
-    );
-    const bottom = point("analysis-node", "bottom"),
+    const workerOut = point("worker-node", "right"),
+      pythonIn = point("python-node", "left");
+    if (workerOut && pythonIn) {
+      curve(
+        { ...workerOut, y: workerOut.y - 5 },
+        { ...pythonIn, y: pythonIn.y - 5 },
+        "tool",
+        "python",
+      );
+      curve(
+        { ...pythonIn, y: pythonIn.y + 5 },
+        { ...workerOut, y: workerOut.y + 5 },
+        "result",
+        "python-result",
+      );
+    }
+    const replyStart = point("loop-node", "top"),
+      replyEnd = point("session-node", "bottom");
+    if (replyStart && replyEnd)
+      curve(
+        { ...replyStart, x: replyStart.x + 8 },
+        { ...replyEnd, x: replyEnd.x + 8 },
+        "result",
+        "reply",
+      );
+    const bottom = point("worker-node", "bottom"),
       browser = point("browser-node", "top");
     if (bottom && browser) {
-      const left = point("analysis-node", "left"),
-        right = point("analysis-node", "right");
+      const left = point("worker-node", "left"),
+        right = point("worker-node", "right");
       const ports = [
         left.x + (right.x - left.x) * 0.28,
         left.x + (right.x - left.x) * 0.75,
       ];
-      const mid = (bottom.y + browser.y) / 2;
+      const border = point("analysis-node", "bottom");
+      const mid = ((border?.y || bottom.y) + browser.y) / 2;
       path(
         "M" +
           ports[0] +
@@ -1912,6 +2449,17 @@
         "csv",
       );
     }
+    const pulseKey = interaction
+      ? (replay ? "replay:" : "live:") +
+        interaction.conversation.message_id +
+        ":" +
+        interaction.id
+      : "";
+    const newPulse = pulseKey !== drawnInteraction;
+    if (newPulse) {
+      pulses.replaceChildren();
+      drawnInteraction = pulseKey;
+    }
     function particle(key, color, repeat = 1) {
       if (!paths[key] || matchMedia("(prefers-reduced-motion:reduce)").matches)
         return;
@@ -1919,39 +2467,48 @@
       dot.setAttribute("r", "3");
       dot.setAttribute("class", "flow-particle " + color);
       const motion = document.createElementNS(ns, "animateMotion");
+      // SVG's default begin=0 is relative to page load. Newly inserted motions
+      // otherwise finish immediately once the page has been open for a while.
+      motion.setAttribute("begin", "indefinite");
       motion.setAttribute("path", paths[key]);
-      motion.setAttribute("dur", replay ? "0.65s" : "1.8s");
+      motion.setAttribute(
+        "dur",
+        replay ? "0.65s" : (liveDelay() - 80) / 1000 + "s",
+      );
       motion.setAttribute("repeatCount", repeat);
+      motion.addEventListener("endEvent", () => dot.remove(), { once: true });
       dot.append(motion);
-      layer.append(dot);
+      pulses.append(dot);
+      motion.beginElement?.();
     }
     if (replay) {
-      if (replay.playing) particle(flow, flow === "work" ? "" : "tool");
+      if (replay.playing && newPulse)
+        particle(flow, flow === "work" ? "" : "tool");
       return;
     }
-    if (!unavailableAnimation()) {
-      if (
-        data.worker.heartbeat_at !== heartbeatDrawn &&
-        now() - data.worker.heartbeat_at < 5
-      ) {
-        particle("work", "");
-        heartbeatDrawn = data.worker.heartbeat_at;
-      }
-      const running = executions().find((e) => e.state === "running");
-      if (running?.tool === "run_python")
-        particle("python", "tool", "indefinite");
-      if (running?.tool === "download_report")
-        particle("cdp", "tool", "indefinite");
+    if (!following || pinnedTurn || unavailableAnimation(flow)) {
+      pulses.replaceChildren();
+      return;
     }
+    if (
+      data.worker.state === "healthy" &&
+      data.worker.heartbeat_at !== heartbeatDrawn &&
+      now() - data.worker.heartbeat_at < 5
+    ) {
+      particle("work", "");
+      heartbeatDrawn = data.worker.heartbeat_at;
+    }
+    if (interaction && newPulse) particle(interaction.flow, "tool");
   }
-  function unavailableAnimation() {
+  function unavailableAnimation(flow) {
     return (
       !!networkError ||
-      !!(selectedTurn && selectedTurn !== data.session.active_message_id) ||
       data.status.state !== "ready" ||
-      data.worker.state !== "healthy" ||
       data.session.stale ||
-      data.execution.stale
+      (["request", "result", "python", "python-result", "cdp", "csv"].includes(
+        flow,
+      ) &&
+        data.execution.stale)
     );
   }
   async function refresh() {
@@ -1969,6 +2526,7 @@
       if (next.version !== 1 || !Array.isArray(next.events)) throw new Error();
       data = next;
       networkError = "";
+      syncLiveFlow();
     } catch {
       networkError =
         "观察接口暂不可用，保留最后已观察的内容；不会自动重发任务。";
@@ -1994,18 +2552,12 @@
     render();
   };
   $("follow-latest").onclick = () => {
-    if (replay || replayLoading) {
-      endReplay(true);
-      following = true;
-    } else following = !following;
-    selectedResource = "";
-    lastSignature = "";
-    render();
+    followLatest();
   };
   $("trace-scope").onchange = () => {
     if ($("trace-scope").value === "session") {
-      endReplay(true);
-      following = true;
+      followLatest();
+      return;
     }
     turnsSignature = lastSignature = "";
     render();
@@ -2055,6 +2607,7 @@
   document.querySelectorAll("[data-resource]").forEach((element) => {
     element.addEventListener("click", (event) => {
       if (event.target.closest("a,.copy")) return;
+      stopLiveFlow();
       pauseReplay();
       selectedResource = element.dataset.resource;
       following = false;

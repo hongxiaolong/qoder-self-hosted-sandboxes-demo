@@ -339,6 +339,7 @@
           </div>
           <div class="filters" role="group" aria-label="事件类型">
             <select id="trace-view" aria-label="轨迹视图">
+              <option value="interactions">组件交互</option>
               <option value="operations">执行视图</option>
               <option value="events">原始事件</option>
             </select>
@@ -351,7 +352,7 @@
             ><button data-filter="heartbeat" aria-pressed="false">心跳</button
             ><select id="trace-scope" aria-label="事件范围">
               <option value="session">整个 Session</option>
-              <option value="input" disabled>选中输入</option>
+              <option value="input" disabled>选中对话</option>
             </select>
           </div>
           <div class="event-scroll" id="event-list" tabindex="-1">
